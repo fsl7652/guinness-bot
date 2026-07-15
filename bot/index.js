@@ -36,9 +36,9 @@ client.on('auth_failure', () => {
 
 client.on('disconnected', reason => {
   console.error('Disconnected:', reason);
-  process.exit(1); // let pm2 restart it
+  process.exit(1);
 });
 
-client.on('message_create', msg => handleMessage(msg, client));
+client.on('message', msg => handleMessage(msg, client));
 
 client.initialize();

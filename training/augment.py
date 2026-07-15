@@ -1,0 +1,1 @@
+# colour jittering, rotation, scaling, translation, perspective transform, gaussian noise, brightness/contrast adjustment

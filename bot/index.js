@@ -1,5 +1,5 @@
-// bot/index.js - Simple WSL version that actually works
-const { Client, LocalAuth, MessageMedia } = require('whatsapp-web.js');
+// bot/index.js - Simple working version for Linux
+const { Client, LocalAuth } = require('whatsapp-web.js');
 const qrcode = require('qrcode-terminal');
 const fs = require('fs');
 const path = require('path');
@@ -13,15 +13,32 @@ dirs.forEach(dir => {
     }
 });
 
-console.log('🐧 Running on Linux (WSL)');
+console.log('🐧 Running on Linux');
 
-// Client with WSL-optimized settings
+// Find Chrome/Chromium
+function findChrome() {
+    const paths = [
+        '/usr/bin/chromium-browser',
+        '/usr/bin/chromium',
+        '/usr/bin/google-chrome-stable',
+        '/usr/bin/google-chrome'
+    ];
+    for (const p of paths) {
+        if (fs.existsSync(p)) {
+            console.log(`✅ Found Chrome at: ${p}`);
+            return p;
+        }
+    }
+    console.log('⚠️ Chrome not found, will use bundled Chromium');
+    return undefined;
+}
+
 const client = new Client({
     authStrategy: new LocalAuth({
         dataPath: path.join(__dirname, '..', 'session')
     }),
     puppeteer: {
-        executablePath: '/usr/bin/chromium-browser',
+        executablePath: findChrome(),
         args: [
             '--no-sandbox',
             '--disable-setuid-sandbox',
@@ -32,36 +49,39 @@ const client = new Client({
     }
 });
 
-// QR Code
 client.on('qr', (qr) => {
     console.log('📱 Scan this QR code:');
     qrcode.generate(qr, { small: true });
 });
 
-// Ready
 client.on('ready', () => {
     console.log('✅ BOT IS READY!');
     console.log(`🕐 ${new Date().toISOString()}`);
+    console.log('📱 Send !ping to test');
 });
 
-// Message handler
 client.on('message', async (msg) => {
     if (msg.fromMe) return;
     
-    console.log(`📩 Message: ${msg.body}`);
+    console.log(`📩 Message: ${msg.body.substring(0, 50)}`);
     
-    // Simple ping
+    // Ping
     if (msg.body === '!ping') {
         await msg.reply('🏓 Pong!');
         return;
     }
     
     // Score with image
-    if (msg.body.startsWith('!score') && msg.hasMedia) {
+    if (msg.body.startsWith('!score')) {
+        if (!msg.hasMedia) {
+            await msg.reply('📸 Please send a photo with !score');
+            return;
+        }
+        
         try {
             await msg.reply('📸 Processing your pint...');
             
-            // This actually works on Linux!
+            // This should work on Linux!
             const media = await msg.downloadMedia();
             
             if (media && media.data) {
@@ -76,18 +96,32 @@ client.on('message', async (msg) => {
                 await msg.reply('❌ Could not download image');
             }
         } catch (error) {
-            console.error('Error:', error);
+            console.error('❌ Error:', error.message);
             await msg.reply('❌ Error processing image');
         }
         return;
     }
     
     // Help
-    if (msg.body === '!help') {
-        await msg.reply(`Commands:\n!ping\n!score [with photo]\n!help`);
+    if (msg.body === '!help' || msg.body === '!h') {
+        await msg.reply(`📋 Commands:
+!ping - Health check
+!me - Your stats
+!leaderboard - Top 10
+!score [with photo] - Score a pint
+!help - Show this menu`);
     }
 });
 
-// Start
+client.on('disconnected', (reason) => {
+    console.log('❌ Disconnected:', reason);
+});
+
+process.on('uncaughtException', (error) => {
+    console.error('💥 Error:', error);
+});
+
 console.log('🚀 Starting bot...');
-client.initialize().catch(console.error);
+client.initialize().catch(error => {
+    console.error('❌ Failed:', error.message);
+});

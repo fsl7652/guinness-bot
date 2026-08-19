@@ -3,3 +3,8 @@ node_modules
 .wwebjs_cache
 data
 ml/models/
+ml/__pycache__/
+training/__pycache__/
+ml/test/
+npm-debug.log
+*.pyc

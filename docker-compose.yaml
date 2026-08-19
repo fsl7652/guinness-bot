@@ -1,0 +1,14 @@
+services:
+  guinness-bot:
+    build: .
+    container_name: guinness-bot
+    restart: unless-stopped
+    environment:
+      - USE_STUB=true
+      - GROUP_JID=${GROUP_JID:-}
+    volumes:
+      - ./session:/app/session
+      - ./data:/app/data
+    shm_size: 512mb
+    tmpfs:
+      - /tmp

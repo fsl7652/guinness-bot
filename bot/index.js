@@ -1,127 +1,107 @@
-// bot/index.js - Simple working version for Linux
-const { Client, LocalAuth } = require('whatsapp-web.js');
-const qrcode = require('qrcode-terminal');
-const fs = require('fs');
-const path = require('path');
+/**
+ * index.js
+ *
+ * WhatsApp client entry point.
+ * Loads session, connects via Baileys, wires incoming messages to handler.js.
+ * Starts the scheduler.
+ */
 
-// Ensure directories exist
-const dirs = ['data/raw', 'session'];
-dirs.forEach(dir => {
-    const fullPath = path.join(__dirname, '..', dir);
-    if (!fs.existsSync(fullPath)) {
-        fs.mkdirSync(fullPath, { recursive: true });
+const {
+  default: makeWASocket,
+  useMultiFileAuthState,
+  DisconnectReason,
+  downloadMediaMessage,
+  fetchLatestBaileysVersion,
+} = require('@whiskeysockets/baileys');
+const { Boom } = require('@hapi/boom');
+const pino     = require('pino');
+const path     = require('path');
+const fs       = require('fs');
+
+const { routeMessage } = require('./handler');
+const { db }            = require('./db');
+const scheduler         = require('./scheduler');
+
+const logger      = pino({ level: process.env.LOG_LEVEL || 'info' });
+const SESSION_DIR = path.join(__dirname, '..', 'session');
+
+fs.mkdirSync(SESSION_DIR, { recursive: true });
+
+// ── Connection ────────────────────────────────────────────────
+
+async function connectToWhatsApp() {
+  const { state, saveCreds }          = await useMultiFileAuthState(SESSION_DIR);
+  const { version, isLatest }         = await fetchLatestBaileysVersion();
+  logger.info({ version, isLatest }, '🔌 Baileys version');
+
+  const sock = makeWASocket({
+    version,
+    auth:              state,
+    printQRInTerminal: true,
+    logger:            pino({ level: 'silent' }),
+    browser:           ['Guinness Bot', 'Chrome', '1.0.0'],
+    connectTimeoutMs:  30_000,
+    retryRequestDelayMs: 2_000,
+    // Keep message history minimal — saves RAM on Jetson
+    getMessage: async () => undefined,
+  });
+
+  sock.ev.on('creds.update', saveCreds);
+
+  sock.ev.on('connection.update', async ({ connection, lastDisconnect, qr }) => {
+    if (qr) logger.info('📱 Scan the QR code to authenticate');
+
+    if (connection === 'close') {
+      const code = new Boom(lastDisconnect?.error)?.output?.statusCode;
+      logger.warn({ code }, '🔴 Connection closed');
+
+      if (code === DisconnectReason.loggedOut) {
+        logger.error('🚪 Logged out — delete /session and restart to re-authenticate');
+        process.exit(1);
+      }
+
+      const delay = code === DisconnectReason.restartRequired ? 1_000 : 5_000;
+      logger.info({ delay }, '🔄 Reconnecting...');
+      setTimeout(connectToWhatsApp, delay);
     }
-});
 
-console.log('🐧 Running on Linux');
-
-// Find Chrome/Chromium
-function findChrome() {
-    const paths = [
-        '/usr/bin/chromium-browser',
-        '/usr/bin/chromium',
-        '/usr/bin/google-chrome-stable',
-        '/usr/bin/google-chrome'
-    ];
-    for (const p of paths) {
-        if (fs.existsSync(p)) {
-            console.log(`✅ Found Chrome at: ${p}`);
-            return p;
-        }
+    if (connection === 'open') {
+      logger.info('✅ WhatsApp connected');
+      scheduler.start(sock);
     }
-    console.log('⚠️ Chrome not found, will use bundled Chromium');
-    return undefined;
+  });
+
+  sock.ev.on('messages.upsert', async ({ messages, type }) => {
+    if (type !== 'notify') return;
+
+    for (const msg of messages) {
+      if (msg.key.fromMe)                                 continue;
+      if (msg.key.remoteJid === 'status@broadcast')       continue;
+
+      try {
+        await routeMessage(sock, msg, { downloadMediaMessage });
+      } catch (err) {
+        logger.error({ err, msgId: msg.key.id }, '❌ Unhandled message error');
+      }
+    }
+  });
+
+  return sock;
 }
 
-const client = new Client({
-    authStrategy: new LocalAuth({
-        dataPath: path.join(__dirname, '..', 'session')
-    }),
-    puppeteer: {
-        executablePath: findChrome(),
-        args: [
-            '--no-sandbox',
-            '--disable-setuid-sandbox',
-            '--disable-dev-shm-usage',
-            '--disable-gpu'
-        ],
-        headless: true
-    }
-});
+// ── Graceful shutdown ─────────────────────────────────────────
 
-client.on('qr', (qr) => {
-    console.log('📱 Scan this QR code:');
-    qrcode.generate(qr, { small: true });
-});
+function shutdown(signal) {
+  logger.info({ signal }, '👋 Shutting down');
+  scheduler.stop();
+  db.close();
+  process.exit(0);
+}
 
-client.on('ready', () => {
-    console.log('✅ BOT IS READY!');
-    console.log(`🕐 ${new Date().toISOString()}`);
-    console.log('📱 Send !ping to test');
-});
+process.on('SIGINT',  () => shutdown('SIGINT'));
+process.on('SIGTERM', () => shutdown('SIGTERM'));
 
-client.on('message', async (msg) => {
-    if (msg.fromMe) return;
-    
-    console.log(`📩 Message: ${msg.body.substring(0, 50)}`);
-    
-    // Ping
-    if (msg.body === '!ping') {
-        await msg.reply('🏓 Pong!');
-        return;
-    }
-    
-    // Score with image
-    if (msg.body.startsWith('!score')) {
-        if (!msg.hasMedia) {
-            await msg.reply('📸 Please send a photo with !score');
-            return;
-        }
-        
-        try {
-            await msg.reply('📸 Processing your pint...');
-            
-            // This should work on Linux!
-            const media = await msg.downloadMedia();
-            
-            if (media && media.data) {
-                const timestamp = Date.now();
-                const filename = path.join(__dirname, '..', 'data', 'raw', `${timestamp}.jpg`);
-                const buffer = Buffer.from(media.data, 'base64');
-                fs.writeFileSync(filename, buffer);
-                
-                await msg.reply(`🍺 Pint scored!\nPour: 7.5/10\nFinal Score: 7.9/10`);
-                console.log(`✅ Image saved: ${filename}`);
-            } else {
-                await msg.reply('❌ Could not download image');
-            }
-        } catch (error) {
-            console.error('❌ Error:', error.message);
-            await msg.reply('❌ Error processing image');
-        }
-        return;
-    }
-    
-    // Help
-    if (msg.body === '!help' || msg.body === '!h') {
-        await msg.reply(`📋 Commands:
-!ping - Health check
-!me - Your stats
-!leaderboard - Top 10
-!score [with photo] - Score a pint
-!help - Show this menu`);
-    }
-});
+process.on('uncaughtException',  (err) => logger.error({ err }, '💥 Uncaught exception'));
+process.on('unhandledRejection', (err) => logger.error({ err }, '💥 Unhandled rejection'));
 
-client.on('disconnected', (reason) => {
-    console.log('❌ Disconnected:', reason);
-});
-
-process.on('uncaughtException', (error) => {
-    console.error('💥 Error:', error);
-});
-
-console.log('🚀 Starting bot...');
-client.initialize().catch(error => {
-    console.error('❌ Failed:', error.message);
-});
+connectToWhatsApp();

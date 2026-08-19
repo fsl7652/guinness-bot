@@ -1,168 +1,241 @@
-// bot/handler.js - Using downloadMediaStream() from official example
-const { MessageMedia } = require('whatsapp-web.js');
-const fs = require('fs');
+/**
+ * handler.js
+ *
+ * Routes incoming WhatsApp messages to the correct command handler.
+ * Responsibilities:
+ *   - Parse command from message text / caption
+ *   - Rate limiting (per user, per command)
+ *   - Download and save images (raw training data + named pint/splitg)
+ *   - Dispatch to score / splitg / leaderboard / me / ping / help
+ *   - Reply with formatted messages from formatter.js
+ */
+
 const path = require('path');
+const fs   = require('fs');
+const pino = require('pino');
 
-// Track processing to prevent duplicates
-const processing = new Set();
+const { scoreImage }     = require('./scorer');
+const { db, queries }    = require('./db');
+const { format }         = require('./formatter');
+const { saveChat }       = require('./scheduler');
 
-async function handleMessage(msg, client) {
-    const body = msg.body || '';
-    const hasMedia = msg.hasMedia;
-    const type = msg.type;
-    
-    console.log(`📩 Message from: ${msg.from}`);
-    console.log(`📝 Body: ${body.substring(0, 50)}`);
-    console.log(`📎 Has media: ${hasMedia}, Type: ${type}`);
+const logger   = pino({ level: process.env.LOG_LEVEL || 'info' });
+const DATA_DIR = path.join(__dirname, '..', 'data', 'raw');
+fs.mkdirSync(DATA_DIR, { recursive: true });
 
-    // ========== TEXT COMMANDS ==========
-    
-    if (body.toLowerCase() === '!ping') {
-        await msg.reply('🏓 Pong!');
-        return;
-    }
-    
-    if (body.toLowerCase() === '!me') {
-        await msg.reply('👤 Your stats: 0 points, 0 pints scored');
-        return;
-    }
-    
-    if (body.toLowerCase() === '!leaderboard') {
-        await msg.reply('🏆 Top 10:\nNo scores yet!');
-        return;
-    }
-    
-    if (body.toLowerCase() === '!help' || body.toLowerCase() === '!h') {
-        const helpText = `📋 Available commands:
-!ping - Health check
-!me - Your stats
-!leaderboard - Top 10
-!score [with photo] - Score a pint
-!help - Show this menu`;
-        await msg.reply(helpText);
-        return;
-    }
+// ── Rate limiting ─────────────────────────────────────────────
+// In-memory per-user per-command cooldowns.
+// Resets on restart — good enough for a pub bot.
 
-    // ========== SCORE COMMAND WITH IMAGE ==========
-    
-    if (body.toLowerCase().startsWith('!score')) {
-        if (!hasMedia) {
-            await msg.reply('📸 Please send a photo with !score');
-            return;
-        }
-        
-        if (type !== 'image') {
-            await msg.reply('📸 Please send an image with !score');
-            return;
-        }
-        
-        const msgId = msg.id.id;
-        if (processing.has(msgId)) {
-            console.log('⏳ Message already being processed');
-            return;
-        }
-        processing.add(msgId);
-        
-        try {
-            console.log('📸 Processing image...');
-            await msg.reply('📸 Processing your pint...');
-            
-            console.log('⏳ Downloading media using downloadMediaStream()...');
-            
-            // ===== USE downloadMediaStream() FROM OFFICIAL EXAMPLE =====
-            const result = await msg.downloadMediaStream();
-            
-            if (!result) {
-                console.error('❌ Media stream download returned undefined');
-                await msg.reply('❌ Could not download your image. Please try again.');
-                processing.delete(msgId);
-                return;
-            }
-            
-            console.log('✅ Media stream downloaded successfully!');
-            console.log(`📊 MIME type: ${result.mimetype}`);
-            console.log(`📊 File size: ${result.filesize} bytes`);
-            console.log(`📊 Filename: ${result.filename || 'unknown'}`);
-            
-            // Save the image using the stream
-            const timestamp = Date.now();
-            const filename = path.join(__dirname, '..', 'data', 'raw', `${timestamp}.jpg`);
-            
-            // Ensure directory exists
-            const dir = path.dirname(filename);
-            if (!fs.existsSync(dir)) {
-                fs.mkdirSync(dir, { recursive: true });
-            }
-            
-            // Write the stream to file
-            const writeStream = fs.createWriteStream(filename);
-            
-            // Pipe the stream to file
-            await new Promise((resolve, reject) => {
-                result.stream.pipe(writeStream);
-                writeStream.on('finish', resolve);
-                writeStream.on('error', reject);
-                result.stream.on('error', reject);
-            });
-            
-            console.log(`✅ Image saved: ${filename}`);
-            
-            // Also get the base64 data for processing (convert the stream to base64)
-            const fileBuffer = fs.readFileSync(filename);
-            const base64Data = fileBuffer.toString('base64');
-            
-            // ====== SCORING LOGIC HERE ======
-            // Now you can use base64Data for your ML model
-            
-            const mockScore = {
-                pour: (6.5 + Math.random() * 3.0).toFixed(1),
-                splitg: Math.random() > 0.3 ? '✅' : '❌',
-                final: (7.0 + Math.random() * 2.5).toFixed(1)
-            };
-            
-            const response = `🍺 Pint scored!
-Pour: ${mockScore.pour}/10
-Split G: ${mockScore.splitg}
-Final Score: ${mockScore.final}/10`;
-            
-            await msg.reply(response);
-            console.log('✅ Score processed successfully');
-            
-        } catch (error) {
-            console.error('❌ Error processing score:', error);
-            console.error('❌ Full error details:', error.stack);
-            await msg.reply('❌ Error processing your pint. Please try again.');
-        } finally {
-            processing.delete(msgId);
-        }
-        return;
-    }
+const RATE_LIMITS = {
+  '!score':       60_000,   // 1 min between scores (model is slow)
+  '!splitg':      30_000,   // 30 s between splitg checks
+  '!leaderboard': 10_000,   // 10 s
+  '!me':          10_000,
+  '!ping':         5_000,
+};
 
-    // ========== SEND MEDIA COMMAND ==========
-    
-    if (body.toLowerCase() === '!sendmedia' || body.toLowerCase() === '!sendpicture') {
-        try {
-            const imageFiles = fs.readdirSync(path.join(__dirname, '..', 'data', 'raw'));
-            if (imageFiles.length > 0) {
-                const latestImage = imageFiles[imageFiles.length - 1];
-                const imagePath = path.join(__dirname, '..', 'data', 'raw', latestImage);
-                const media = MessageMedia.fromFilePath(imagePath);
-                await client.sendMessage(msg.from, media, { 
-                    caption: '📸 Here\'s your latest scored pint!' 
-                });
-            } else {
-                await msg.reply('No images found. Score a pint first!');
-            }
-        } catch (error) {
-            console.error('Error sending media:', error);
-            await msg.reply('❌ Error sending image');
-        }
-        return;
-    }
+// Map of `userId:cmd` → timestamp of last use
+const lastUsed = new Map();
 
-    if (body.startsWith('!')) {
-        await msg.reply('Unknown command. Send !help for available commands.');
-    }
+function isRateLimited(userId, cmd) {
+  const limit = RATE_LIMITS[cmd];
+  if (!limit) return false;
+
+  const key  = `${userId}:${cmd}`;
+  const last = lastUsed.get(key) ?? 0;
+  const now  = Date.now();
+
+  if (now - last < limit) {
+    return Math.ceil((limit - (now - last)) / 1000);  // seconds remaining
+  }
+
+  lastUsed.set(key, now);
+  return false;
 }
 
-module.exports = { handleMessage };
+// ── Image helpers ─────────────────────────────────────────────
+
+async function downloadAndSave(sock, msg, downloadMediaMessage, type) {
+  const buffer = await downloadMediaMessage(
+    msg, 'buffer', {},
+    { logger, reuploadRequest: sock.updateMediaMessage }
+  );
+
+  const userId   = senderOf(msg).split('@')[0].replace(/\W/g, '_');
+  const filename = `${type}_${userId}_${Date.now()}.jpg`;
+  const filepath = path.join(DATA_DIR, filename);
+
+  await fs.promises.writeFile(filepath, buffer);
+  logger.info({ filepath }, '💾 Image saved');
+
+  // Record in DB for training data tracking
+  queries.insertImage.run(userId, filepath, type, new Date().toISOString());
+
+  return filepath;
+}
+
+// ── Message parsing ───────────────────────────────────────────
+
+function extractText(msg) {
+  return (
+    msg.message?.conversation              ||
+    msg.message?.extendedTextMessage?.text ||
+    msg.message?.imageMessage?.caption     ||
+    ''
+  ).trim();
+}
+
+function senderOf(msg) {
+  return msg.key.participant || msg.key.remoteJid;
+}
+
+function hasImage(msg) {
+  return !!msg.message?.imageMessage;
+}
+
+// ── Main router ───────────────────────────────────────────────
+
+async function routeMessage(sock, msg, { downloadMediaMessage }) {
+  const jid      = msg.key.remoteJid;
+  const sender   = senderOf(msg);
+  const userId   = sender.split('@')[0];
+  const pushName = msg.pushName || 'Unknown';
+  const text     = extractText(msg);
+
+  if (!text.startsWith('!')) return;
+
+  const [rawCmd, ...args] = text.split(/\s+/);
+  const cmd = rawCmd.toLowerCase();
+
+  logger.info({ cmd, userId, hasImg: hasImage(msg) }, '⌨️ Command');
+
+  // Register this chat so the scheduler can broadcast to it
+  saveChat(jid);
+
+  // Rate limit check (skip for unknown commands)
+  const wait = isRateLimited(userId, cmd);
+  if (wait) {
+    await sock.sendMessage(jid, {
+      text: `⏳ Slow down! Try \`${cmd}\` again in ${wait}s.`,
+    });
+    return;
+  }
+
+  switch (cmd) {
+    case '!score':    return handleScore(sock, msg, jid, sender, userId, pushName, downloadMediaMessage);
+    case '!splitg':   return handleSplitg(sock, msg, jid, sender, userId, pushName, downloadMediaMessage);
+    case '!leaderboard':
+    case '!lb':       return handleLeaderboard(sock, jid);
+    case '!me':       return handleMe(sock, jid, userId, pushName);
+    case '!ping':     return sock.sendMessage(jid, { text: '🏓 Pong!' });
+    case '!help':     return handleHelp(sock, jid);
+    default:
+      logger.debug({ cmd }, 'Unknown command');
+  }
+}
+
+// ── !score ────────────────────────────────────────────────────
+
+async function handleScore(sock, msg, jid, sender, userId, pushName, downloadMediaMessage) {
+  if (!hasImage(msg)) {
+    return sock.sendMessage(jid, {
+      text: '📸 Attach a pint photo and send *!score* as the caption.',
+    });
+  }
+
+  await sock.sendMessage(jid, { text: '🍺 Analysing your pint…' });
+
+  let filepath;
+  try {
+    filepath = await downloadAndSave(sock, msg, downloadMediaMessage, 'pint');
+    const result = await scoreImage(filepath, null, pushName);
+
+    // Persist each detected glass
+    for (const glass of result.glasses) {
+      queries.insertScore.run(
+        userId, pushName, filepath,
+        glass.pint_score,
+        JSON.stringify(glass.breakdown ?? {}),
+        JSON.stringify(glass.splitg    ?? {}),
+        JSON.stringify(glass.warnings  ?? []),
+        'pint'
+      );
+    }
+
+    await sock.sendMessage(jid, { text: result.message });
+
+  } catch (err) {
+    logger.error({ err, filepath }, '❌ !score failed');
+    await sock.sendMessage(jid, { text: friendlyError(err.message) });
+  }
+}
+
+// ── !splitg ───────────────────────────────────────────────────
+
+async function handleSplitg(sock, msg, jid, sender, userId, pushName, downloadMediaMessage) {
+  if (!hasImage(msg)) {
+    return sock.sendMessage(jid, {
+      text: '📸 Attach a mid-sip photo and send *!splitg* as the caption.',
+    });
+  }
+
+  await sock.sendMessage(jid, { text: '🔍 Checking the G split…' });
+
+  let filepath;
+  try {
+    filepath = await downloadAndSave(sock, msg, downloadMediaMessage, 'splitg');
+    const result = await scoreImage(null, filepath, pushName);
+
+    // Find the most recent score for this user to attach splitg result to
+    const lastScore = queries.lastScoreForUser.get(userId);
+    if (lastScore) {
+      queries.updateSplitg.run(
+        JSON.stringify(result.splitg ?? {}),
+        lastScore.id
+      );
+    }
+
+    await sock.sendMessage(jid, { text: format.splitgReply(result.splitg, pushName) });
+
+  } catch (err) {
+    logger.error({ err, filepath }, '❌ !splitg failed');
+    await sock.sendMessage(jid, { text: friendlyError(err.message) });
+  }
+}
+
+// ── !leaderboard ──────────────────────────────────────────────
+
+async function handleLeaderboard(sock, jid) {
+  const rows = queries.leaderboard.all(10);
+  await sock.sendMessage(jid, { text: format.leaderboard(rows) });
+}
+
+// ── !me ───────────────────────────────────────────────────────
+
+async function handleMe(sock, jid, userId, pushName) {
+  const stats   = queries.userStats.get(userId);
+  const rankRow = queries.userRank.get(userId);
+  const recent  = queries.recentScores.all(userId, 3);
+  await sock.sendMessage(jid, { text: format.me(pushName, stats, rankRow, recent) });
+}
+
+// ── !help ─────────────────────────────────────────────────────
+
+async function handleHelp(sock, jid) {
+  await sock.sendMessage(jid, { text: format.help() });
+}
+
+// ── Error messages ────────────────────────────────────────────
+
+function friendlyError(msg) {
+  if (msg.includes('No glasses detected'))
+    return '⚠️ No pint glass detected — make sure the glass is clearly visible and try again.';
+  if (msg.includes('timed out'))
+    return '⚠️ Scoring timed out. Try again in a moment.';
+  if (msg.includes('decode') || msg.includes('imdecode'))
+    return '⚠️ Couldn\'t read the image. Send a standard JPEG photo.';
+  return '⚠️ Something went wrong. Please try again.';
+}
+
+module.exports = { routeMessage };

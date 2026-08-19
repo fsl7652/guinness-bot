@@ -150,8 +150,8 @@ def format_whatsapp(result, glass_index=None, display_name=None):
     b     = result["breakdown"]
     g     = result["splitg"]
     score = result["pint_score"]
-
-    header = f"🍺 *{display_name + \"'s \" if display_name else ''}"
+    name_part = f"{display_name}'s " if display_name else ''
+    header = f"🍺 *{name_part}"
     if glass_index:
         header += f"Glass {glass_index} — "
     header += f"{score}/10*"

@@ -40,6 +40,11 @@ PADDING         = 16
 SAM_IOU_THRESH  = 0.75    # minimum SAM IoU score to accept a mask
 
 
+import sys
+
+def _log(*args):
+    print(*args, file=sys.stderr, flush=True)
+
 # ── MobileSAM lazy load ───────────────────────────────────────
 
 _sam_predictor  = None
@@ -68,7 +73,7 @@ def _get_sam():
         _sam_model.to(device).eval()
         _sam_predictor = SamPredictor(_sam_model)
 
-        print(f"[segment] MobileSAM loaded on {device}")
+        _log(f"[segment] MobileSAM loaded on {device}")
         return _sam_predictor
 
     except ImportError:
@@ -279,7 +284,12 @@ def _find_opencv_candidates(image_rgb, debug=False):
     filtered = filtered[:MAX_GLASSES]
 
     if debug:
-        print(f"[segment] OpenCV: {len(all_boxes)} raw → {len(merged)} merged → {len(filtered)} filtered")
+        _log(f"[segment] OpenCV: {len(all_boxes)} raw → {len(merged)} merged → {len(filtered)} filtered")
+
+    margin = min(h, w) // 6
+    candidates_extra = [(margin, margin, w - margin, h - margin)]
+    filtered = _merge_boxes(filtered + candidates_extra)
+    filtered = filtered[:MAX_GLASSES]
 
     return filtered
 
@@ -320,11 +330,11 @@ def _sam_refine(predictor, image_rgb, bbox, debug=False):
     best_mask  = masks[best_idx]
 
     if debug:
-        print(f"[segment]   SAM scores: {scores}  best={best_score:.3f}")
+        _log(f"[segment]   SAM scores: {scores}  best={best_score:.3f}")
 
     if best_score < SAM_IOU_THRESH:
         if debug:
-            print(f"[segment]   Rejected — SAM score {best_score:.3f} < {SAM_IOU_THRESH}")
+            _log(f"[segment]   Rejected — SAM score {best_score:.3f} < {SAM_IOU_THRESH}")
         return None, best_score
 
     # Convert mask to bounding box
@@ -376,7 +386,7 @@ def _is_likely_guinness(crop_rgb, debug=False):
     diff              = top_brightness - bottom_brightness
 
     if debug:
-        print(f"[segment]   Guinness check: top={top_brightness:.1f} "
+        _log(f"[segment]   Guinness check: top={top_brightness:.1f} "
               f"bot={bottom_brightness:.1f} diff={diff:.1f} pass={diff > THRESHOLD}")
 
     return diff > THRESHOLD
@@ -416,7 +426,7 @@ def get_glass_crops(image_rgb, debug=False):
         fallback   = True
 
     if debug:
-        print(f"[segment] {len(candidates)} candidate(s) → SAM refinement")
+        _log(f"[segment] {len(candidates)} candidate(s) → SAM refinement")
 
     # Stage 2: SAM refine each candidate
     results     = []
@@ -424,13 +434,13 @@ def get_glass_crops(image_rgb, debug=False):
 
     for i, bbox in enumerate(candidates):
         if debug:
-            print(f"[segment] Candidate {i}: bbox={bbox}")
+            _log(f"[segment] Candidate {i}: bbox={bbox}")
 
         refined_bbox, score = _sam_refine(predictor, image_rgb, bbox, debug=debug)
 
         if refined_bbox is None:
             if debug:
-                print(f"[segment] Candidate {i} rejected by SAM")
+                _log(f"[segment] Candidate {i} rejected by SAM")
             continue
 
         rx1, ry1, rx2, ry2 = refined_bbox
@@ -451,7 +461,7 @@ def get_glass_crops(image_rgb, debug=False):
 
         if duplicate:
             if debug:
-                print(f"[segment] Candidate {i} duplicate — skipped")
+                _log(f"[segment] Candidate {i} duplicate — skipped")
             continue
 
         # Aspect ratio check on refined bbox
@@ -459,7 +469,7 @@ def get_glass_crops(image_rgb, debug=False):
         bh = ry2 - ry1
         if bh / max(bw, 1) < MIN_ASPECT:
             if debug:
-                print(f"[segment] Candidate {i} aspect ratio too low ({bh/max(bw,1):.2f})")
+                _log(f"[segment] Candidate {i} aspect ratio too low ({bh/max(bw,1):.2f})")
             continue
 
         # Pad crop
@@ -470,7 +480,7 @@ def get_glass_crops(image_rgb, debug=False):
         crop = image_rgb[py1:py2, px1:px2]
 
         if not _is_likely_guinness(crop, debug=debug):
-            print(f"[segment] Candidate {i} rejected — failed Guinness colour check")
+            _log(f"[segment] Candidate {i} rejected — failed Guinness colour check")
             continue
 
         seen_bboxes.append(refined_bbox)
@@ -490,7 +500,7 @@ def get_glass_crops(image_rgb, debug=False):
         r["index"] = i
 
     mode = "fallback-grid" if fallback else "opencv+sam"
-    print(f"[segment] {len(results)} glass(es) detected ({mode})")
+    _log(f"[segment] {len(results)} glass(es) detected ({mode})")
 
     return results
 

@@ -1,27 +1,12 @@
 """
 segment.py
 
-Two-stage glass detection pipeline:
+Two-stage glass detection pipeline using ONNX Runtime GPU for MobileSAM.
 
-  Stage 1 — OpenCV candidate finder (fast, ~50ms)
-    Runs three complementary strategies and unions results:
-    - Colour filter: dark body + bright head (Guinness HSV signature)
-    - Vertical edge detection: tall parallel edges (glass sides)
-    - Contour detection: large tall-narrow blobs
+Stage 1 — OpenCV candidate finder (~50ms)
+Stage 2 — MobileSAM ONNX Runtime inference (encoder + decoder via CUDA EP)
 
-  Stage 2 — MobileSAM refinement (accurate, ~2-3s per glass)
-    For each OpenCV candidate, runs SamPredictor with 3 prompt points.
-    Produces accurate mask → clean crop for scoring modules.
-
-  Fallback — if OpenCV finds no candidates, falls back to a 2x3 grid
-    of SAM prompts (6 calls) rather than full auto-generation (256 calls).
-
-Usage:
-    from segment import get_glass_crops
-    crops = get_glass_crops(image_rgb)
-
-Test locally:
-    python segment.py path/to/pint.jpg [output.jpg] [--debug]
+Falls back to a 2x3 grid if OpenCV finds nothing.
 """
 
 import cv2
@@ -29,84 +14,174 @@ import numpy as np
 import sys
 from pathlib import Path
 
-
 # ── Constants ─────────────────────────────────────────────────
 
-MIN_ASPECT      = 1.5     # height/width — glasses are taller than wide
-MIN_AREA_FRAC   = 0.03    # at least 3% of frame
-MAX_AREA_FRAC   = 0.75    # not the whole image
-MAX_GLASSES     = 4
-PADDING         = 16
-SAM_IOU_THRESH  = 0.75    # minimum SAM IoU score to accept a mask
+MIN_ASPECT    = 1.5
+MIN_AREA_FRAC = 0.03
+MAX_AREA_FRAC = 0.75
+MAX_GLASSES   = 4
+PADDING       = 16
+SAM_IOU_THRESH = 0.75
+
+ENCODER_PATH = Path(__file__).parent / "models" / "mobile_sam_encoder.quant.onnx"
+DECODER_PATH = Path(__file__).parent / "models" / "mobile_sam_decoder.quant.onnx"
+
+IMAGE_SIZE = 1024   # MobileSAM expected input size
+
+# ── ONNX Runtime sessions (lazy load) ────────────────────────
+
+_encoder_session = None
+_decoder_session = None
+
+def _get_sessions():
+    global _encoder_session, _decoder_session
+    if _encoder_session is not None:
+        return _encoder_session, _decoder_session
+
+    import onnxruntime as ort
+
+    providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']
+
+    available = ort.get_available_providers()
+    if 'CUDAExecutionProvider' not in available:
+        print("[segment] WARNING: CUDAExecutionProvider not available, falling back to CPU", file=sys.stderr)
+        providers = ['CPUExecutionProvider']
+
+    opts = ort.SessionOptions()
+    opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+
+    _encoder_session = ort.InferenceSession(
+        str(ENCODER_PATH), sess_options=opts, providers=providers
+    )
+    _decoder_session = ort.InferenceSession(
+        str(DECODER_PATH), sess_options=opts, providers=providers
+    )
+
+    provider_used = _encoder_session.get_providers()[0]
+    print(f"[segment] MobileSAM ONNX loaded ({provider_used})", file=sys.stderr)
+
+    return _encoder_session, _decoder_session
 
 
-import sys
+# ── Image preprocessing ───────────────────────────────────────
 
-def _log(*args):
-    print(*args, file=sys.stderr, flush=True)
+def _preprocess_image(image_rgb):
+    """
+    Resize and normalise image for MobileSAM encoder.
+    Returns preprocessed tensor and scale factors for coordinate mapping.
+    """
+    h, w = image_rgb.shape[:2]
 
-# ── MobileSAM lazy load ───────────────────────────────────────
+    # Resize to 1024x1024 (samexporter --use-preprocess bakes this in)
+    resized = cv2.resize(image_rgb, (IMAGE_SIZE, IMAGE_SIZE))
 
-_sam_predictor  = None
-_sam_model      = None
+    # Normalise (ImageNet mean/std)
+    mean = np.array([123.675, 116.28, 103.53], dtype=np.float32)
+    std  = np.array([58.395, 57.12, 57.375],   dtype=np.float32)
+    img  = (resized.astype(np.float32) - mean) / std
 
-def _get_sam():
-    global _sam_predictor, _sam_model
-    if _sam_predictor is not None:
-        return _sam_predictor
+    # HWC → NCHW
+    img = img.transpose(2, 0, 1)[np.newaxis]
 
-    try:
-        from mobile_sam import sam_model_registry, SamPredictor
-        import torch
+    scale_x = IMAGE_SIZE / w
+    scale_y = IMAGE_SIZE / h
 
-        weights = Path(__file__).parent / "models" / "mobile_sam.pt"
-        if not weights.exists():
-            raise FileNotFoundError(
-                f"MobileSAM weights not found at {weights}\n"
-                "Download: https://github.com/ChaoningZhang/MobileSAM"
-            )
-
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        torch.cuda.empty_cache()
-
-        _sam_model = sam_model_registry["vit_t"](checkpoint=str(weights))
-        _sam_model.to(device).eval()
-        _sam_predictor = SamPredictor(_sam_model)
-
-        _log(f"[segment] MobileSAM loaded on {device}")
-        return _sam_predictor
-
-    except ImportError:
-        raise ImportError(
-            "MobileSAM not installed.\n"
-            "Run: pip install git+https://github.com/ChaoningZhang/MobileSAM.git timm==0.6.13"
-        )
+    return img, scale_x, scale_y, h, w
 
 
-# ── Stage 1: OpenCV candidate finder ─────────────────────────
+# ── SAM inference ─────────────────────────────────────────────
+
+def _encode_image(encoder, img_tensor):
+    """Run encoder, return image embedding."""
+    input_name = encoder.get_inputs()[0].name
+    embedding  = encoder.run(None, {input_name: img_tensor})[0]
+    return embedding
+
+
+def _decode_mask(decoder, embedding, points, labels, orig_h, orig_w):
+    """
+    Run decoder with point prompts.
+    Returns (mask, iou_score).
+    """
+    # Points must be float32, shape (1, N, 2)
+    point_coords = points.astype(np.float32)[np.newaxis]
+    point_labels = labels.astype(np.float32)[np.newaxis]
+
+    orig_im_size = np.array([orig_h, orig_w], dtype=np.float32)
+
+    inputs = {
+        'image_embeddings': embedding,
+        'point_coords':     point_coords,
+        'point_labels':     point_labels,
+        'orig_im_size':     orig_im_size,
+    }
+
+    # Handle decoders that also want mask_input and has_mask_input
+    input_names = [i.name for i in decoder.get_inputs()]
+    if 'mask_input' in input_names:
+        inputs['mask_input']     = np.zeros((1, 1, 256, 256), dtype=np.float32)
+        inputs['has_mask_input'] = np.zeros(1, dtype=np.float32)
+
+    outputs = decoder.run(None, inputs)
+
+    # outputs: [masks, iou_predictions, low_res_masks]
+    masks           = outputs[0][0]   # (num_masks, H, W)
+    iou_predictions = outputs[1][0]   # (num_masks,)
+
+    best_idx   = int(np.argmax(iou_predictions))
+    best_mask  = masks[best_idx] > 0  # threshold at 0
+    best_score = float(iou_predictions[best_idx])
+
+    return best_mask, best_score
+
+
+def _sam_refine(encoder, decoder, embedding, scale_x, scale_y,
+                orig_h, orig_w, bbox, debug=False):
+    """
+    Prompt SAM decoder with 3 points inside the candidate bbox.
+    Returns (refined_bbox, score) or (None, score).
+    """
+    x1, y1, x2, y2 = bbox
+    cx    = (x1 + x2) / 2
+    h_third = (y2 - y1) / 3
+
+    # Scale points to encoder input space
+    raw_points = np.array([
+        [cx,           y1 + h_third],
+        [cx,           (y1 + y2) / 2],
+        [cx,           y2 - h_third],
+    ], dtype=np.float32)
+
+    scaled_points = raw_points * np.array([[scale_x, scale_y]])
+    labels        = np.ones(len(scaled_points), dtype=np.float32)
+
+    mask, score = _decode_mask(decoder, embedding, scaled_points, labels, orig_h, orig_w)
+
+    if debug:
+        print(f"[segment]   SAM score={score:.3f}", file=sys.stderr)
+
+    if score < SAM_IOU_THRESH:
+        if debug:
+            print(f"[segment]   Rejected — score {score:.3f} < {SAM_IOU_THRESH}", file=sys.stderr)
+        return None, score
+
+    rows = np.where(mask.any(axis=1))[0]
+    cols = np.where(mask.any(axis=0))[0]
+
+    if len(rows) == 0 or len(cols) == 0:
+        return None, score
+
+    return (int(cols.min()), int(rows.min()), int(cols.max()), int(rows.max())), score
+
+
+# ── OpenCV candidate finder ───────────────────────────────────
 
 def _candidates_from_colour(image_rgb, h, w):
-    """
-    Find regions with Guinness colour signature:
-    dark (near-black) body in lower portion, bright (white/cream) head on top.
-    Uses HSV colour filtering and looks for vertically stacked dark/bright regions.
-    """
     hsv = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2HSV)
-
-    # Dark body: low saturation, low value (dark brown/black)
-    dark_mask = cv2.inRange(hsv,
-        np.array([0,   0,   0]),
-        np.array([180, 80, 80])
-    )
-
-    # Bright head: low saturation, high value (white/cream)
-    bright_mask = cv2.inRange(hsv,
-        np.array([0,   0,   160]),
-        np.array([40,  80,  255])
-    )
+    dark_mask   = cv2.inRange(hsv, np.array([0,0,0]),   np.array([180,80,80]))
+    bright_mask = cv2.inRange(hsv, np.array([0,0,160]), np.array([40,80,255]))
 
     candidates = []
-    # Slide a vertical window across the image looking for dark-over-bright stacking
     step  = w // 8
     win_w = w // 5
 
@@ -114,26 +189,18 @@ def _candidates_from_colour(image_rgb, h, w):
         x1 = max(0, cx - win_w // 2)
         x2 = min(w, cx + win_w // 2)
 
-        dark_col   = dark_mask[:, x1:x2]
-        bright_col = bright_mask[:, x1:x2]
-
-        # Find topmost bright region (head)
-        bright_rows = np.where(bright_col.any(axis=1))[0]
-        dark_rows   = np.where(dark_col.any(axis=1))[0]
+        bright_rows = np.where(bright_mask[:, x1:x2].any(axis=1))[0]
+        dark_rows   = np.where(dark_mask[:, x1:x2].any(axis=1))[0]
 
         if len(bright_rows) < 5 or len(dark_rows) < 10:
             continue
 
         head_top = int(bright_rows.min())
-        head_bot = int(bright_rows.max())
         body_bot = int(dark_rows.max())
 
-        # Head must be above body
-        if head_bot >= body_bot:
+        if int(bright_rows.max()) >= body_bot:
             continue
-
-        total_h = body_bot - head_top
-        if total_h < h * 0.15:
+        if body_bot - head_top < h * 0.15:
             continue
 
         candidates.append((x1, head_top, x2, body_bot))
@@ -142,110 +209,59 @@ def _candidates_from_colour(image_rgb, h, w):
 
 
 def _candidates_from_edges(image_rgb, h, w):
-    """
-    Find tall vertical edge pairs — the sides of a glass.
-    """
-    gray   = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2GRAY)
-    blur   = cv2.GaussianBlur(gray, (5, 5), 0)
-    edges  = cv2.Canny(blur, 30, 100)
-
-    # Dilate edges horizontally to connect nearby verticals
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 15))
-    dilated = cv2.dilate(edges, kernel)
-
-    contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    gray    = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2GRAY)
+    edges   = cv2.Canny(cv2.GaussianBlur(gray, (5,5), 0), 30, 100)
+    dilated = cv2.dilate(edges, cv2.getStructuringElement(cv2.MORPH_RECT, (3,15)))
 
     candidates = []
-    for c in contours:
+    for c in cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[0]:
         x, y, cw, ch = cv2.boundingRect(c)
-        aspect    = ch / max(cw, 1)
-        area_frac = (cw * ch) / (h * w)
-
-        if aspect < MIN_ASPECT:
-            continue
-        if not (MIN_AREA_FRAC <= area_frac <= MAX_AREA_FRAC):
-            continue
-
-        candidates.append((x, y, x + cw, y + ch))
+        if ch / max(cw,1) < MIN_ASPECT: continue
+        if not (MIN_AREA_FRAC <= (cw*ch)/(h*w) <= MAX_AREA_FRAC): continue
+        candidates.append((x, y, x+cw, y+ch))
 
     return candidates
 
 
 def _candidates_from_contours(image_rgb, h, w):
-    """
-    Find large tall-narrow blobs using adaptive thresholding.
-    Works well for glasses against varied backgrounds.
-    """
-    gray    = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2GRAY)
-    thresh  = cv2.adaptiveThreshold(
-        gray, 255,
-        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY_INV, 21, 4
-    )
-
-    kernel  = np.ones((5, 5), np.uint8)
-    closed  = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
-
-    contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    gray   = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2GRAY)
+    thresh = cv2.adaptiveThreshold(gray, 255,
+                cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 21, 4)
+    closed = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, np.ones((5,5), np.uint8))
 
     candidates = []
-    for c in contours:
+    for c in cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[0]:
         x, y, cw, ch = cv2.boundingRect(c)
-        aspect    = ch / max(cw, 1)
-        area_frac = (cw * ch) / (h * w)
-
-        if aspect < MIN_ASPECT:
-            continue
-        if not (MIN_AREA_FRAC <= area_frac <= MAX_AREA_FRAC):
-            continue
-
-        candidates.append((x, y, x + cw, y + ch))
+        if ch / max(cw,1) < MIN_ASPECT: continue
+        if not (MIN_AREA_FRAC <= (cw*ch)/(h*w) <= MAX_AREA_FRAC): continue
+        candidates.append((x, y, x+cw, y+ch))
 
     return candidates
 
 
 def _merge_boxes(boxes, iou_thresh=0.3):
-    """
-    Merge overlapping bounding boxes from different detection strategies.
-    Uses IoU-based greedy merging.
-    """
-    if not boxes:
-        return []
-
-    boxes  = list(set(boxes))  # deduplicate exact matches
+    if not boxes: return []
+    boxes  = list(set(boxes))
     merged = []
 
     while boxes:
         base = list(boxes.pop(0))
-        to_merge = []
-
         remaining = []
+
         for b in boxes:
-            ix1 = max(base[0], b[0])
-            iy1 = max(base[1], b[1])
-            ix2 = min(base[2], b[2])
-            iy2 = min(base[3], b[3])
-
+            ix1, iy1 = max(base[0],b[0]), max(base[1],b[1])
+            ix2, iy2 = min(base[2],b[2]), min(base[3],b[3])
             if ix2 <= ix1 or iy2 <= iy1:
-                remaining.append(b)
-                continue
+                remaining.append(b); continue
 
-            inter = (ix2 - ix1) * (iy2 - iy1)
-            area1 = (base[2]-base[0]) * (base[3]-base[1])
-            area2 = (b[2]-b[0]) * (b[3]-b[1])
-            union = area1 + area2 - inter
+            inter = (ix2-ix1)*(iy2-iy1)
+            union = (base[2]-base[0])*(base[3]-base[1]) + (b[2]-b[0])*(b[3]-b[1]) - inter
 
-            if inter / union > iou_thresh:
-                to_merge.append(b)
+            if inter/union > iou_thresh:
+                base[0]=min(base[0],b[0]); base[1]=min(base[1],b[1])
+                base[2]=max(base[2],b[2]); base[3]=max(base[3],b[3])
             else:
                 remaining.append(b)
-
-        # Expand base to cover all merged boxes
-        for b in to_merge:
-            base[0] = min(base[0], b[0])
-            base[1] = min(base[1], b[1])
-            base[2] = max(base[2], b[2])
-            base[3] = max(base[3], b[3])
 
         merged.append(tuple(base))
         boxes = remaining
@@ -254,10 +270,6 @@ def _merge_boxes(boxes, iou_thresh=0.3):
 
 
 def _find_opencv_candidates(image_rgb, debug=False):
-    """
-    Run all three OpenCV strategies, merge results, filter by aspect ratio.
-    Returns list of (x1, y1, x2, y2) candidate bounding boxes.
-    """
     h, w = image_rgb.shape[:2]
 
     all_boxes = []
@@ -265,131 +277,55 @@ def _find_opencv_candidates(image_rgb, debug=False):
     all_boxes.extend(_candidates_from_edges(image_rgb, h, w))
     all_boxes.extend(_candidates_from_contours(image_rgb, h, w))
 
-    merged = _merge_boxes(all_boxes)
+    # Always include centre-of-frame for close-up shots
+    margin = min(h, w) // 6
+    all_boxes.append((margin, margin, w - margin, h - margin))
 
-    # Final aspect ratio + area filter
+    merged   = _merge_boxes(all_boxes)
     filtered = []
-    for (x1, y1, x2, y2) in merged:
-        bw = x2 - x1
-        bh = y2 - y1
-        if bh / max(bw, 1) < MIN_ASPECT:
-            continue
-        area_frac = (bw * bh) / (h * w)
-        if not (MIN_AREA_FRAC <= area_frac <= MAX_AREA_FRAC):
-            continue
-        filtered.append((x1, y1, x2, y2))
 
-    # Sort left to right, cap at MAX_GLASSES
+    for (x1,y1,x2,y2) in merged:
+        bw, bh = x2-x1, y2-y1
+        if bh / max(bw,1) < MIN_ASPECT: continue
+        if not (MIN_AREA_FRAC <= (bw*bh)/(h*w) <= MAX_AREA_FRAC): continue
+        filtered.append((x1,y1,x2,y2))
+
     filtered.sort(key=lambda b: b[0])
     filtered = filtered[:MAX_GLASSES]
 
     if debug:
-        _log(f"[segment] OpenCV: {len(all_boxes)} raw → {len(merged)} merged → {len(filtered)} filtered")
-
-    margin = min(h, w) // 6
-    candidates_extra = [(margin, margin, w - margin, h - margin)]
-    filtered = _merge_boxes(filtered + candidates_extra)
-    filtered = filtered[:MAX_GLASSES]
+        print(f"[segment] OpenCV: {len(all_boxes)} raw → {len(merged)} merged → {len(filtered)} filtered", file=sys.stderr)
 
     return filtered
 
 
-# ── Stage 2: SAM refinement ───────────────────────────────────
-
-def _sam_refine(predictor, image_rgb, bbox, debug=False):
-    """
-    Run SamPredictor on a single candidate bounding box.
-    Prompts SAM with 3 points inside the box (top-third, centre, bottom-third).
-    Returns the best mask as a bounding box, or None if no good mask found.
-    """
-    x1, y1, x2, y2 = bbox
-    cx = (x1 + x2) // 2
-    h_third = (y2 - y1) // 3
-
-    points = np.array([
-        [cx, y1 + h_third],        # upper third (head region)
-        [cx, (y1 + y2) // 2],      # centre
-        [cx, y2 - h_third],        # lower third (body region)
-    ], dtype=np.float32)
-
-    labels = np.ones(len(points), dtype=np.int32)
-
-    # Also pass the bounding box as a SAM box prompt for better accuracy
-    sam_box = np.array([x1, y1, x2, y2], dtype=np.float32)
-
-    masks, scores, _ = predictor.predict(
-        point_coords=points,
-        point_labels=labels,
-        box=sam_box,
-        multimask_output=True,
-    )
-
-    # Take highest scoring mask that passes IoU threshold
-    best_idx   = int(np.argmax(scores))
-    best_score = float(scores[best_idx])
-    best_mask  = masks[best_idx]
-
-    if debug:
-        _log(f"[segment]   SAM scores: {scores}  best={best_score:.3f}")
-
-    if best_score < SAM_IOU_THRESH:
-        if debug:
-            _log(f"[segment]   Rejected — SAM score {best_score:.3f} < {SAM_IOU_THRESH}")
-        return None, best_score
-
-    # Convert mask to bounding box
-    rows = np.where(best_mask.any(axis=1))[0]
-    cols = np.where(best_mask.any(axis=0))[0]
-
-    if len(rows) == 0 or len(cols) == 0:
-        return None, best_score
-
-    mx1, my1 = int(cols.min()), int(rows.min())
-    mx2, my2 = int(cols.max()), int(rows.max())
-
-    return (mx1, my1, mx2, my2), best_score
-
-
 def _fallback_grid_candidates(h, w):
-    """
-    Fallback: 2x3 grid of candidate regions when OpenCV finds nothing.
-    Covers left/centre/right × top-half/bottom-half.
-    Far fewer SAM calls than full auto-generation (6 vs 256).
-    """
     candidates = []
     for col_frac in [0.2, 0.5, 0.8]:
         for row_frac in [0.3, 0.7]:
-            cx = int(w * col_frac)
-            cy = int(h * row_frac)
-            bw = w // 4
-            bh = h // 2
-            x1 = max(0, cx - bw // 2)
-            y1 = max(0, cy - bh // 2)
-            x2 = min(w, cx + bw // 2)
-            y2 = min(h, cy + bh // 2)
-            candidates.append((x1, y1, x2, y2))
+            cx, cy = int(w*col_frac), int(h*row_frac)
+            bw, bh = w//4, h//2
+            candidates.append((
+                max(0,cx-bw//2), max(0,cy-bh//2),
+                min(w,cx+bw//2), min(h,cy+bh//2)
+            ))
     return candidates
 
 
-# ── Guinness colour check ─────────────────────────────────────
-
 def _is_likely_guinness(crop_rgb, debug=False):
-    """
-    Verify crop has bright top (head) over dark bottom (body).
-    """
-    THRESHOLD = 25
+    gray   = cv2.cvtColor(crop_rgb, cv2.COLOR_RGB2GRAY)
+    h      = gray.shape[0]
+    top    = float(gray[:h//4].mean())
+    bottom = float(gray[h//2:].mean())
+    diff   = top - bottom
 
-    gray              = cv2.cvtColor(crop_rgb, cv2.COLOR_RGB2GRAY)
-    h                 = gray.shape[0]
-    top_brightness    = float(gray[:h // 4].mean())
-    bottom_brightness = float(gray[h // 2:].mean())
-    diff              = top_brightness - bottom_brightness
+    # Body must be dark (near-black Guinness body)
+    body_dark = bottom < 100
 
     if debug:
-        _log(f"[segment]   Guinness check: top={top_brightness:.1f} "
-              f"bot={bottom_brightness:.1f} diff={diff:.1f} pass={diff > THRESHOLD}")
+        print(f"[segment]   Guinness check: top={top:.1f} bot={bottom:.1f} diff={diff:.1f} dark={body_dark}", file=sys.stderr)
 
-    return diff > THRESHOLD
+    return diff > 20 and body_dark
 
 
 # ── Main entry point ──────────────────────────────────────────
@@ -403,84 +339,74 @@ def get_glass_crops(image_rgb, debug=False):
         debug:     verbose logging
 
     Returns list of dicts:
-        {
-            "crop":  numpy RGB array,
-            "bbox":  (x1, y1, x2, y2),
-            "score": SAM IoU confidence,
-            "index": 0-based left-to-right position
-        }
+        { "crop", "bbox", "score", "index" }
     """
-    h, w      = image_rgb.shape[:2]
-    predictor = _get_sam()
+    h, w = image_rgb.shape[:2]
 
-    # Set image once — shared across all SAM calls for this frame
-    predictor.set_image(image_rgb)
+    encoder, decoder = _get_sessions()
 
-    # Stage 1: OpenCV candidates
+    # Encode image once
+    img_tensor, scale_x, scale_y, orig_h, orig_w = _preprocess_image(image_rgb)
+    embedding = _encode_image(encoder, img_tensor)
+
+    # OpenCV candidates
     candidates = _find_opencv_candidates(image_rgb, debug=debug)
     fallback   = False
 
     if not candidates:
-        print("[segment] No OpenCV candidates — using fallback grid")
+        print("[segment] No OpenCV candidates — using fallback grid", file=sys.stderr)
         candidates = _fallback_grid_candidates(h, w)
         fallback   = True
 
     if debug:
-        _log(f"[segment] {len(candidates)} candidate(s) → SAM refinement")
+        print(f"[segment] {len(candidates)} candidate(s) → SAM refinement", file=sys.stderr)
 
-    # Stage 2: SAM refine each candidate
     results     = []
     seen_bboxes = []
 
     for i, bbox in enumerate(candidates):
         if debug:
-            _log(f"[segment] Candidate {i}: bbox={bbox}")
+            print(f"[segment] Candidate {i}: bbox={bbox}", file=sys.stderr)
 
-        refined_bbox, score = _sam_refine(predictor, image_rgb, bbox, debug=debug)
+        refined_bbox, score = _sam_refine(
+            encoder, decoder, embedding,
+            scale_x, scale_y, orig_h, orig_w,
+            bbox, debug=debug
+        )
 
         if refined_bbox is None:
-            if debug:
-                _log(f"[segment] Candidate {i} rejected by SAM")
             continue
 
         rx1, ry1, rx2, ry2 = refined_bbox
 
-        # Deduplicate against already accepted results
+        # Deduplicate
         duplicate = False
         for sb in seen_bboxes:
-            sx1, sy1, sx2, sy2 = sb
-            ix1, iy1 = max(rx1, sx1), max(ry1, sy1)
-            ix2, iy2 = min(rx2, sx2), min(ry2, sy2)
+            sx1,sy1,sx2,sy2 = sb
+            ix1,iy1 = max(rx1,sx1), max(ry1,sy1)
+            ix2,iy2 = min(rx2,sx2), min(ry2,sy2)
             if ix2 > ix1 and iy2 > iy1:
                 inter = (ix2-ix1)*(iy2-iy1)
-                area1 = (rx2-rx1)*(ry2-ry1)
-                area2 = (sx2-sx1)*(sy2-sy1)
-                if inter / (area1 + area2 - inter) > 0.4:
-                    duplicate = True
-                    break
+                a1    = (rx2-rx1)*(ry2-ry1)
+                a2    = (sx2-sx1)*(sy2-sy1)
+                if inter/(a1+a2-inter) > 0.4:
+                    duplicate = True; break
 
         if duplicate:
-            if debug:
-                _log(f"[segment] Candidate {i} duplicate — skipped")
             continue
 
-        # Aspect ratio check on refined bbox
-        bw = rx2 - rx1
-        bh = ry2 - ry1
-        if bh / max(bw, 1) < MIN_ASPECT:
-            if debug:
-                _log(f"[segment] Candidate {i} aspect ratio too low ({bh/max(bw,1):.2f})")
+        bw, bh = rx2-rx1, ry2-ry1
+        if bh / max(bw,1) < MIN_ASPECT:
             continue
 
-        # Pad crop
-        px1 = max(0, rx1 - PADDING)
-        py1 = max(0, ry1 - PADDING)
-        px2 = min(w, rx2 + PADDING)
-        py2 = min(h, ry2 + PADDING)
+        px1 = max(0, rx1-PADDING)
+        py1 = max(0, ry1-PADDING)
+        px2 = min(w, rx2+PADDING)
+        py2 = min(h, ry2+PADDING)
         crop = image_rgb[py1:py2, px1:px2]
 
         if not _is_likely_guinness(crop, debug=debug):
-            _log(f"[segment] Candidate {i} rejected — failed Guinness colour check")
+            print(f"[segment] Candidate {i} rejected — failed Guinness colour check", file=sys.stderr)
             continue
 
         seen_bboxes.append(refined_bbox)
@@ -494,13 +420,12 @@ def get_glass_crops(image_rgb, debug=False):
         if len(results) >= MAX_GLASSES:
             break
 
-    # Sort left to right and reindex
     results.sort(key=lambda r: r["bbox"][0])
     for i, r in enumerate(results):
         r["index"] = i
 
     mode = "fallback-grid" if fallback else "opencv+sam"
-    _log(f"[segment] {len(results)} glass(es) detected ({mode})")
+    print(f"[segment] {len(results)} glass(es) detected ({mode})", file=sys.stderr)
 
     return results
 
@@ -520,21 +445,16 @@ def visualise(image_path, output_path=None, debug=False):
         print("No glasses detected")
         return
 
-    colours   = [(0,255,0), (0,165,255), (255,0,0), (0,255,255)]
+    colours   = [(0,255,0),(0,165,255),(255,0,0),(0,255,255)]
     annotated = img_bgr.copy()
 
     for g in crops:
-        x1, y1, x2, y2 = g["bbox"]
+        x1,y1,x2,y2 = g["bbox"]
         col = colours[g["index"] % len(colours)]
-        cv2.rectangle(annotated, (x1, y1), (x2, y2), col, 3)
-        cv2.putText(
-            annotated,
-            f"Glass {g['index']+1}  {g['score']:.2f}",
-            (x1, max(20, y1 - 10)),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.9, col, 2
-        )
-        print(f"  Glass {g['index']+1}: bbox={g['bbox']}  "
-              f"score={g['score']:.3f}  crop={g['crop'].shape[:2]}")
+        cv2.rectangle(annotated, (x1,y1), (x2,y2), col, 3)
+        cv2.putText(annotated, f"Glass {g['index']+1}  {g['score']:.2f}",
+                    (x1, max(20,y1-10)), cv2.FONT_HERSHEY_SIMPLEX, 0.9, col, 2)
+        print(f"  Glass {g['index']+1}: bbox={g['bbox']}  score={g['score']:.3f}  crop={g['crop'].shape[:2]}")
 
     if output_path:
         cv2.imwrite(str(output_path), annotated)
@@ -546,9 +466,6 @@ def visualise(image_path, output_path=None, debug=False):
             print(f"Saved crop → {crop_file}")
     else:
         cv2.imshow("Detected glasses", annotated)
-        for g in crops:
-            cv2.imshow(f"Glass {g['index']+1}", cv2.cvtColor(g["crop"], cv2.COLOR_RGB2BGR))
-        print("Press any key to close")
         cv2.waitKey(0)
         cv2.destroyAllWindows()
 
@@ -558,8 +475,7 @@ if __name__ == "__main__":
         print("Usage: python segment.py <image> [output] [--debug]")
         sys.exit(1)
 
-    _debug      = "--debug" in sys.argv
-    _image_path = sys.argv[1]
-    _output     = next((a for a in sys.argv[2:] if not a.startswith("--")), None)
-
-    visualise(_image_path, _output, debug=_debug)
+    _debug  = "--debug" in sys.argv
+    _image  = sys.argv[1]
+    _output = next((a for a in sys.argv[2:] if not a.startswith("--")), None)
+    visualise(_image, _output, debug=_debug)

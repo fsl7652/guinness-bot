@@ -1,183 +1,105 @@
 """
 glass_check.py
 
-Classifies whether the glass is a proper Guinness tulip glass.
-Currently uses a shape heuristic stub — replace with trained model later.
+Classifies glass type using TRT engine (or ONNX fallback).
+Classes: guinness_midsip, guinness_tulip, not_glass, wrong_glass
 
-The tulip glass has a distinctive profile:
-- Narrows in the lower third
-- Widens toward the top
-- Has a curved lip
-
-Stub mode uses column-width profile analysis.
-Real mode loads a MobileNetV3 binary classifier (tulip / not-tulip).
-
-Usage:
-    from glass_check import analyse
-    result = analyse(crop_rgb)
-    # {"is_tulip": True, "confidence": 0.81, "score": 10.0, "mode": "stub"}
-
-Test locally:
-    python glass_check.py <image_path> [output_path]
+Returns score: 10.0 for tulip, 4.0 otherwise.
 """
 
-import cv2
-import numpy as np
 import sys
 from pathlib import Path
 
-MODEL_PATH = Path(__file__).parent / "models" / "glass_check.onnx"
-USE_STUB   = not MODEL_PATH.exists()
+MODEL_DIR  = Path(__file__).parent / "models"
+TRT_PATH   = MODEL_DIR / "glass_check.trt"
+ONNX_PATH  = MODEL_DIR / "glass_check.onnx"
+JSON_PATH  = MODEL_DIR / "glass_check.json"
 
+CLASSES    = ["guinness_midsip", "guinness_tulip", "not_glass", "wrong_glass"]
+TULIP_CLASS = "guinness_tulip"
 
-# ── Stub: heuristic shape analysis ───────────────────────────
+_classifier = None
 
-def _profile_widths(crop_rgb, n_rows=40):
-    """
-    Measure the glass width at evenly spaced rows using edge detection.
-    Returns an array of widths from top to bottom.
-    """
-    gray    = cv2.cvtColor(crop_rgb, cv2.COLOR_RGB2GRAY)
-    h, w    = gray.shape
-    rows    = np.linspace(int(h * 0.1), int(h * 0.9), n_rows).astype(int)
-    widths  = []
+def _get_classifier():
+    global _classifier
+    if _classifier is None:
+        from trt_infer import load_classifier
+        # Load classes from json if available
+        classes = CLASSES
+        if JSON_PATH.exists():
+            import json
+            with open(JSON_PATH) as f:
+                data = json.load(f)
+                classes = data.get("classes", CLASSES)
+        _classifier = load_classifier(TRT_PATH, ONNX_PATH, classes)
+    return _classifier
 
-    for y in rows:
-        row     = gray[y]
-        # Find leftmost and rightmost dark→light transition
-        thresh  = cv2.threshold(row.reshape(1, -1), 0, 255,
-                                cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1][0]
-        nonzero = np.where(thresh > 0)[0]
-        if len(nonzero) < 2:
-            widths.append(0)
-        else:
-            widths.append(int(nonzero[-1] - nonzero[0]))
-
-    return np.array(widths, dtype=float)
-
-
-def _stub_analyse(crop_rgb):
-    """
-    Heuristic tulip detection based on glass profile shape.
-
-    A tulip glass narrows in the bottom third then widens toward the top.
-    We measure width at top, middle, and bottom and check the ratio.
-    """
-    widths = _profile_widths(crop_rgb)
-    if widths.max() == 0:
-        return {"is_tulip": True, "confidence": 0.5, "mode": "stub",
-                "reason": "could not measure profile"}
-
-    n    = len(widths)
-    top  = widths[:n // 3].mean()
-    mid  = widths[n // 3: 2 * n // 3].mean()
-    bot  = widths[2 * n // 3:].mean()
-
-    # Tulip: top > mid (narrows then flares), bottom narrower than top
-    # Straight pint: roughly uniform width
-    narrowing = (top - mid) / max(top, 1)   # positive = narrows toward middle
-    flare     = (top - bot) / max(top, 1)   # positive = wider at top than bottom
-
-    is_tulip   = narrowing > 0.05 and flare > 0.05
-    confidence = min(0.95, 0.5 + narrowing + flare)
-
-    return {
-        "is_tulip":   bool(is_tulip),
-        "confidence": round(float(confidence), 3),
-        "mode":       "stub",
-        "narrowing":  round(float(narrowing), 3),
-        "flare":      round(float(flare), 3),
-    }
-
-
-# ── Real model ────────────────────────────────────────────────
-
-def _model_analyse(crop_rgb):
-    """
-    Run ONNX MobileNetV3 classifier.
-    Output class 0 = not tulip, class 1 = tulip.
-    """
-    import onnxruntime as ort
-
-    session = ort.InferenceSession(str(MODEL_PATH))
-
-    img = cv2.resize(crop_rgb, (224, 224)).astype(np.float32) / 255.0
-    img = (img - [0.485, 0.456, 0.406]) / [0.229, 0.224, 0.225]
-    inp = img.transpose(2, 0, 1)[np.newaxis].astype(np.float32)
-
-    logits  = session.run(None, {"image": inp})[0][0]
-    probs   = np.exp(logits) / np.exp(logits).sum()
-    is_tulip    = bool(probs[1] > probs[0])
-    confidence  = float(probs[1] if is_tulip else probs[0])
-
-    return {
-        "is_tulip":   is_tulip,
-        "confidence": round(confidence, 3),
-        "mode":       "model",
-    }
-
-
-# ── Main entry point ──────────────────────────────────────────
 
 def analyse(crop_rgb):
     """
     Args:
-        crop_rgb: numpy RGB array — full glass crop
+        crop_rgb: numpy RGB array
 
     Returns dict:
         is_tulip    — bool
-        confidence  — 0–1
-        score       — 10.0 if tulip, 4.0 if not (fed into aggregator)
-        mode        — "stub" or "model"
+        confidence  — 0-1
+        score       — 10.0 if tulip, 4.0 otherwise
+        label       — raw class label
+        mode        — 'trt' or 'onnx'
     """
-    result = _stub_analyse(crop_rgb) if USE_STUB else _model_analyse(crop_rgb)
-    result["score"] = 10.0 if result["is_tulip"] else 4.0
-    return result
+    try:
+        clf          = _get_classifier()
+        label, conf  = clf.predict(crop_rgb)
+        is_tulip     = label == TULIP_CLASS
+        mode         = 'trt' if TRT_PATH.exists() else 'onnx'
+    except Exception as e:
+        print(f"[glass_check] Classifier error: {e} — using stub", file=sys.stderr)
+        return _stub_analyse(crop_rgb)
+
+    return {
+        "is_tulip":   is_tulip,
+        "confidence": round(conf, 3),
+        "score":      10.0 if is_tulip else 4.0,
+        "label":      label,
+        "mode":       mode,
+    }
 
 
-# ── Visualisation ─────────────────────────────────────────────
+def _stub_analyse(crop_rgb):
+    """Heuristic fallback — profile width analysis."""
+    import cv2
+    import numpy as np
 
-def visualise(image_path, output_path=None):
-    img_bgr = cv2.imread(str(image_path))
-    if img_bgr is None:
-        print(f"Could not load: {image_path}")
-        return
+    gray   = cv2.cvtColor(crop_rgb, cv2.COLOR_RGB2GRAY)
+    h, w   = gray.shape
+    rows   = np.linspace(int(h*0.1), int(h*0.9), 40).astype(int)
+    widths = []
 
-    img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-    result  = analyse(img_rgb)
+    for y in rows:
+        row    = gray[y]
+        thresh = cv2.threshold(row.reshape(1,-1), 0, 255,
+                               cv2.THRESH_BINARY+cv2.THRESH_OTSU)[1][0]
+        nz     = np.where(thresh > 0)[0]
+        widths.append(int(nz[-1]-nz[0]) if len(nz)>=2 else 0)
 
-    print(f"Is tulip:    {result['is_tulip']}")
-    print(f"Confidence:  {result['confidence']}")
-    print(f"Score:       {result['score']}/10")
-    print(f"Mode:        {result['mode']}")
+    widths   = np.array(widths, dtype=float)
+    if widths.max() == 0:
+        return {"is_tulip":True,"confidence":0.5,"score":10.0,"label":"unknown","mode":"stub"}
 
-    # Draw profile widths
-    annotated = img_bgr.copy()
-    widths    = _profile_widths(img_rgb)
-    h, w      = annotated.shape[:2]
-    rows      = np.linspace(int(h * 0.1), int(h * 0.9), len(widths)).astype(int)
-    col       = (0, 255, 0) if result["is_tulip"] else (0, 0, 255)
+    n   = len(widths)
+    top = widths[:n//3].mean()
+    mid = widths[n//3:2*n//3].mean()
+    bot = widths[2*n//3:].mean()
 
-    for i, (y, wd) in enumerate(zip(rows, widths)):
-        cx = w // 2
-        cv2.line(annotated, (cx - int(wd/2), y), (cx + int(wd/2), y), col, 1)
+    narrowing  = (top-mid)/max(top,1)
+    flare      = (top-bot)/max(top,1)
+    is_tulip   = narrowing > 0.05 and flare > 0.05
+    confidence = min(0.95, 0.5+narrowing+flare)
 
-    cv2.putText(annotated,
-                f"{'Tulip' if result['is_tulip'] else 'Not tulip'}  "
-                f"{result['confidence']:.0%}  [{result['mode']}]",
-                (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, col, 2)
-
-    if output_path:
-        cv2.imwrite(str(output_path), annotated)
-        print(f"Saved → {output_path}")
-    else:
-        cv2.imshow("Glass check", annotated)
-        cv2.waitKey(0)
-        cv2.destroyAllWindows()
-
-
-if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print("Usage: python glass_check.py <image> [output]")
-        sys.exit(1)
-    visualise(sys.argv[1], sys.argv[2] if len(sys.argv) > 2 else None)
+    return {
+        "is_tulip":   bool(is_tulip),
+        "confidence": round(float(confidence),3),
+        "score":      10.0 if is_tulip else 4.0,
+        "label":      "guinness_tulip" if is_tulip else "wrong_glass",
+        "mode":       "stub",
+    }

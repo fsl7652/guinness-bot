@@ -61,50 +61,35 @@ def _get_sessions():
     _log(f"[segment] Encoder on: {_encoder_session.get_providers()[0]}")
     _log(f"[segment] Decoder on: {_decoder_session.get_providers()[0]}")
 
-    # INSPECT MODEL INPUT SHAPES HERE
-    _inspect_model_input(_encoder_session, "Encoder")
-    _inspect_model_input(_decoder_session, "Decoder")
-
     return _encoder_session, _decoder_session
 
-
-def _inspect_model_input(session, name="Model"):
-    """Inspect and log the input details of an ONNX model."""
-    _log(f"\n[segment] {name} Input Details:")
-    for inp in session.get_inputs():
-        _log(f"  - {inp.name}: shape={inp.shape}, type={inp.type}")
-    
-    _log(f"[segment] {name} Output Details:")
-    for out in session.get_outputs():
-        _log(f"  - {out.name}: shape={out.shape}, type={out.type}")
-    _log("")
 
 # ── Preprocessing ─────────────────────────────────────────────
 
 def _preprocess(image_rgb):
-    h, w   = image_rgb.shape[:2]
-    scale  = IMAGE_SIZE / max(h, w)
-    new_h  = int(h * scale)
-    new_w  = int(w * scale)
+    """
+    Resize image for SAM encoder.
+    samexporter --use-preprocess encoder expects HWC float32, no batch dim.
+    Preprocessing (normalisation, padding) is done inside the ONNX graph.
+    """
+    h, w  = image_rgb.shape[:2]
+    scale = IMAGE_SIZE / max(h, w)
+    new_h = int(h * scale)
+    new_w = int(w * scale)
+
     resized = cv2.resize(image_rgb, (new_w, new_h))
 
-    padded = np.zeros((IMAGE_SIZE, IMAGE_SIZE, 3), dtype=np.uint8)
-    padded[:new_h, :new_w] = resized
+    # Pad to IMAGE_SIZE x IMAGE_SIZE
+    padded = np.zeros((IMAGE_SIZE, IMAGE_SIZE, 3), dtype=np.float32)
+    padded[:new_h, :new_w] = resized.astype(np.float32)
 
-    mean   = np.array([123.675, 116.28, 103.53], dtype=np.float32)
-    std    = np.array([58.395,  57.12,  57.375],  dtype=np.float32)
-    
-    # Normalize and keep as 3D HWC format (Height, Width, Channels)
-    tensor = (padded.astype(np.float32) - mean) / std
-    # Do NOT add batch dimension - keep as 3D
-    
-    return tensor, scale, new_h, new_w
+    return padded, scale, new_h, new_w
 
 
 def _get_image_embedding(encoder, image_rgb):
-    tensor_3d, scale, new_h, new_w = _preprocess(image_rgb)
-    # tensor_3d is already in the correct format: (H, W, 3)
-    embedding = encoder.run(None, {"input_image": tensor_3d})[0]
+    tensor, scale, new_h, new_w = _preprocess(image_rgb)
+    # Input: HWC float32, no batch dimension
+    embedding = encoder.run(None, {"input_image": tensor})[0]
     return embedding, scale, new_h, new_w
 
 
@@ -247,9 +232,9 @@ def _is_likely_guinness(crop_rgb, mask=None, debug=False):
     """
     THRESHOLD = 20
     DARK_MAX  = 130  # relaxed — pub lighting varies
- 
+
     gray = cv2.cvtColor(crop_rgb, cv2.COLOR_RGB2GRAY).astype(np.float32)
- 
+
     if mask is not None:
         # Crop mask to same region
         mh, mw = mask.shape
@@ -265,80 +250,81 @@ def _is_likely_guinness(crop_rgb, mask=None, debug=False):
         gray_masked = gray.copy()
         gray_masked[mask_crop == 0] = bg_val
         gray = gray_masked
- 
+
     h      = gray.shape[0]
     top    = float(gray[:h//4].mean())
     bottom = float(gray[h//2:].mean())
     diff   = top - bottom
- 
+
     if debug:
         _log(f"[segment]   Guinness check: top={top:.1f} bot={bottom:.1f} "
              f"diff={diff:.1f} dark={bottom<DARK_MAX} pass={diff>THRESHOLD and bottom<DARK_MAX}")
- 
+
     return diff > THRESHOLD and bottom < DARK_MAX
- 
- 
+
+
 # ── SAM refinement ────────────────────────────────────────────
- 
+
 def _sam_refine(decoder, embedding, scale, orig_h, orig_w, bbox, debug=False):
     x1,y1,x2,y2 = bbox
     cx  = (x1+x2)/2
     h3  = (y2-y1)/3
- 
+
     raw_points = np.array([
         [cx, y1+h3], [cx, (y1+y2)/2], [cx, y2-h3],
         [0, 0],  # background
     ], dtype=np.float32) * scale
- 
+
     labels = np.array([1,1,1,0], dtype=np.float32)
- 
+
     mask, score = _decode_mask(decoder, embedding, raw_points, labels, orig_h, orig_w)
- 
+
     if debug:
         _log(f"[segment]   SAM score: {score:.3f}")
- 
+
     if score < SAM_IOU_THRESH:
         return None, None, score
- 
+
     rows = np.where(mask.any(axis=1))[0]
     cols = np.where(mask.any(axis=0))[0]
     if len(rows)==0 or len(cols)==0:
         return None, None, score
- 
+
     return (int(cols.min()),int(rows.min()),int(cols.max()),int(rows.max())), mask, score
- 
- 
+
+
 # ── Main entry point ──────────────────────────────────────────
+
 def get_glass_crops(image_rgb, debug=False):
     h, w = image_rgb.shape[:2]
     encoder, decoder = _get_sessions()
- 
+
     _log("[segment] Encoding image...")
     embedding, scale, new_h, new_w = _get_image_embedding(encoder, image_rgb)
     _log("[segment] Image encoded")
- 
+
     candidates = _find_opencv_candidates(image_rgb, debug=debug)
     fallback   = False
- 
+
     if not candidates:
         _log("[segment] No OpenCV candidates — using fallback grid")
         candidates = _fallback_grid_candidates(h, w)
         fallback   = True
- 
+
     results     = []
     seen_bboxes = []
- 
+
     for i, bbox in enumerate(candidates):
         if debug:
             _log(f"[segment] Candidate {i}: {bbox}")
- 
+
         refined_bbox, sam_mask, score = _sam_refine(decoder, embedding, scale, h, w, bbox, debug)
- 
+
         if refined_bbox is None:
             continue
- 
+
         rx1,ry1,rx2,ry2 = refined_bbox
- 
+
         # Deduplication
         dup = False
         for sb in seen_bboxes:
@@ -352,34 +338,33 @@ def get_glass_crops(image_rgb, debug=False):
                     dup=True; break
         if dup:
             continue
- 
+
         if (ry2-ry1)/max(rx2-rx1,1) < MIN_ASPECT:
             continue
- 
+
         px1=max(0,rx1-PADDING); py1=max(0,ry1-PADDING)
         px2=min(w,rx2+PADDING); py2=min(h,ry2+PADDING)
         crop = image_rgb[py1:py2, px1:px2]
- 
+
         # Crop mask to same padded region for colour check
         mask_crop = sam_mask[py1:py2, px1:px2] if sam_mask is not None else None
- 
+
         if not _is_likely_guinness(crop, mask=mask_crop, debug=debug):
             _log(f"[segment] Candidate {i} rejected — failed Guinness colour check")
             continue
- 
+
         seen_bboxes.append(refined_bbox)
         results.append({"crop":crop,"bbox":(px1,py1,px2,py2),"score":score,"index":len(results)})
- 
+
         if len(results) >= MAX_GLASSES:
             break
- 
+
     results.sort(key=lambda r: r["bbox"][0])
     for i,r in enumerate(results):
         r["index"] = i
- 
+
     _log(f"[segment] {len(results)} glass(es) detected ({'fallback-grid' if fallback else 'opencv+sam'})")
     return results
-
 
 
 # ── Visualisation ─────────────────────────────────────────────

@@ -180,14 +180,14 @@ class ONNXClassifier:
 
 def load_classifier(trt_path, onnx_path, classes):
     """
-    Load TRT engine if available, fall back to ONNX Runtime.
+    Load ONNX Runtime classifier (GPU if available).
+    TRT path kept for future use but ONNX Runtime is used for compatibility.
     """
-    if Path(trt_path).exists():
-        return TRTClassifier(trt_path, classes)
-    elif Path(onnx_path).exists():
-        _log(f"[trt] {Path(trt_path).name} not found — using ONNX fallback")
+    if Path(onnx_path).exists():
         return ONNXClassifier(onnx_path, classes)
+    elif Path(trt_path).exists():
+        return TRTClassifier(trt_path, classes)
     else:
         raise FileNotFoundError(
-            f"Neither {trt_path} nor {onnx_path} found"
+            f"Neither {onnx_path} nor {trt_path} found"
         )

@@ -61,8 +61,23 @@ def _get_sessions():
     _log(f"[segment] Encoder on: {_encoder_session.get_providers()[0]}")
     _log(f"[segment] Decoder on: {_decoder_session.get_providers()[0]}")
 
+    # INSPECT MODEL INPUT SHAPES HERE
+    _inspect_model_input(_encoder_session, "Encoder")
+    _inspect_model_input(_decoder_session, "Decoder")
+
     return _encoder_session, _decoder_session
 
+
+def _inspect_model_input(session, name="Model"):
+    """Inspect and log the input details of an ONNX model."""
+    _log(f"\n[segment] {name} Input Details:")
+    for inp in session.get_inputs():
+        _log(f"  - {inp.name}: shape={inp.shape}, type={inp.type}")
+    
+    _log(f"[segment] {name} Output Details:")
+    for out in session.get_outputs():
+        _log(f"  - {out.name}: shape={out.shape}, type={out.type}")
+    _log("")
 
 # ── Preprocessing ─────────────────────────────────────────────
 
@@ -78,15 +93,18 @@ def _preprocess(image_rgb):
 
     mean   = np.array([123.675, 116.28, 103.53], dtype=np.float32)
     std    = np.array([58.395,  57.12,  57.375],  dtype=np.float32)
+    
+    # Normalize and keep as 3D HWC format (Height, Width, Channels)
     tensor = (padded.astype(np.float32) - mean) / std
-    tensor = tensor.transpose(2, 0, 1)[np.newaxis]
-
+    # Do NOT add batch dimension - keep as 3D
+    
     return tensor, scale, new_h, new_w
 
 
 def _get_image_embedding(encoder, image_rgb):
-    tensor, scale, new_h, new_w = _preprocess(image_rgb)
-    embedding = encoder.run(None, {"input_image": tensor})[0]
+    tensor_3d, scale, new_h, new_w = _preprocess(image_rgb)
+    # tensor_3d is already in the correct format: (H, W, 3)
+    embedding = encoder.run(None, {"input_image": tensor_3d})[0]
     return embedding, scale, new_h, new_w
 
 
@@ -221,53 +239,75 @@ def _fallback_grid_candidates(h, w):
     ]
 
 
-def _is_likely_guinness(crop_rgb, debug=False):
-    THRESHOLD = 25
-    DARK_MAX  = 100
-
-    gray   = cv2.cvtColor(crop_rgb, cv2.COLOR_RGB2GRAY)
+def _is_likely_guinness(crop_rgb, mask=None, debug=False):
+    """
+    Check crop has bright head over dark body.
+    If a SAM mask is provided, zero out background pixels before checking
+    so surrounding scene doesn't corrupt the brightness calculation.
+    """
+    THRESHOLD = 20
+    DARK_MAX  = 130  # relaxed — pub lighting varies
+ 
+    gray = cv2.cvtColor(crop_rgb, cv2.COLOR_RGB2GRAY).astype(np.float32)
+ 
+    if mask is not None:
+        # Crop mask to same region
+        mh, mw = mask.shape
+        ch, cw = gray.shape
+        # Resize mask to crop dimensions
+        mask_crop = cv2.resize(
+            mask.astype(np.uint8),
+            (cw, mh),
+            interpolation=cv2.INTER_NEAREST
+        )[:ch, :cw]
+        # Replace background with NaN equivalent — use mean of masked region
+        bg_val = float(gray[mask_crop > 0].mean()) if mask_crop.any() else gray.mean()
+        gray_masked = gray.copy()
+        gray_masked[mask_crop == 0] = bg_val
+        gray = gray_masked
+ 
     h      = gray.shape[0]
     top    = float(gray[:h//4].mean())
     bottom = float(gray[h//2:].mean())
     diff   = top - bottom
-
+ 
     if debug:
         _log(f"[segment]   Guinness check: top={top:.1f} bot={bottom:.1f} "
              f"diff={diff:.1f} dark={bottom<DARK_MAX} pass={diff>THRESHOLD and bottom<DARK_MAX}")
-
+ 
     return diff > THRESHOLD and bottom < DARK_MAX
-
-
+ 
+ 
 # ── SAM refinement ────────────────────────────────────────────
-
+ 
 def _sam_refine(decoder, embedding, scale, orig_h, orig_w, bbox, debug=False):
     x1,y1,x2,y2 = bbox
     cx  = (x1+x2)/2
     h3  = (y2-y1)/3
-
+ 
     raw_points = np.array([
         [cx, y1+h3], [cx, (y1+y2)/2], [cx, y2-h3],
         [0, 0],  # background
     ], dtype=np.float32) * scale
-
+ 
     labels = np.array([1,1,1,0], dtype=np.float32)
-
+ 
     mask, score = _decode_mask(decoder, embedding, raw_points, labels, orig_h, orig_w)
-
+ 
     if debug:
         _log(f"[segment]   SAM score: {score:.3f}")
-
+ 
     if score < SAM_IOU_THRESH:
-        return None, score
-
+        return None, None, score
+ 
     rows = np.where(mask.any(axis=1))[0]
     cols = np.where(mask.any(axis=0))[0]
     if len(rows)==0 or len(cols)==0:
-        return None, score
-
-    return (int(cols.min()),int(rows.min()),int(cols.max()),int(rows.max())), score
-
-
+        return None, None, score
+ 
+    return (int(cols.min()),int(rows.min()),int(cols.max()),int(rows.max())), mask, score
+ 
+ 
 # ── Main entry point ──────────────────────────────────────────
 
 def get_glass_crops(image_rgb, debug=False):

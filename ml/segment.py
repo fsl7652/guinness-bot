@@ -61,23 +61,8 @@ def _get_sessions():
     _log(f"[segment] Encoder on: {_encoder_session.get_providers()[0]}")
     _log(f"[segment] Decoder on: {_decoder_session.get_providers()[0]}")
 
-    # INSPECT MODEL INPUT SHAPES HERE
-    _inspect_model_input(_encoder_session, "Encoder")
-    _inspect_model_input(_decoder_session, "Decoder")
-
     return _encoder_session, _decoder_session
 
-
-def _inspect_model_input(session, name="Model"):
-    """Inspect and log the input details of an ONNX model."""
-    _log(f"\n[segment] {name} Input Details:")
-    for inp in session.get_inputs():
-        _log(f"  - {inp.name}: shape={inp.shape}, type={inp.type}")
-    
-    _log(f"[segment] {name} Output Details:")
-    for out in session.get_outputs():
-        _log(f"  - {out.name}: shape={out.shape}, type={out.type}")
-    _log("")
 
 # ── Preprocessing ─────────────────────────────────────────────
 
@@ -93,18 +78,15 @@ def _preprocess(image_rgb):
 
     mean   = np.array([123.675, 116.28, 103.53], dtype=np.float32)
     std    = np.array([58.395,  57.12,  57.375],  dtype=np.float32)
-    
-    # Normalize and keep as 3D HWC format (Height, Width, Channels)
     tensor = (padded.astype(np.float32) - mean) / std
-    # Do NOT add batch dimension - keep as 3D
-    
+    tensor = tensor.transpose(2, 0, 1)[np.newaxis]
+
     return tensor, scale, new_h, new_w
 
 
 def _get_image_embedding(encoder, image_rgb):
-    tensor_3d, scale, new_h, new_w = _preprocess(image_rgb)
-    # tensor_3d is already in the correct format: (H, W, 3)
-    embedding = encoder.run(None, {"input_image": tensor_3d})[0]
+    tensor, scale, new_h, new_w = _preprocess(image_rgb)
+    embedding = encoder.run(None, {"input_image": tensor})[0]
     return embedding, scale, new_h, new_w
 
 

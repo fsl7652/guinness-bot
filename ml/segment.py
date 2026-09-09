@@ -309,37 +309,36 @@ def _sam_refine(decoder, embedding, scale, orig_h, orig_w, bbox, debug=False):
  
  
 # ── Main entry point ──────────────────────────────────────────
-
 def get_glass_crops(image_rgb, debug=False):
     h, w = image_rgb.shape[:2]
     encoder, decoder = _get_sessions()
-
+ 
     _log("[segment] Encoding image...")
     embedding, scale, new_h, new_w = _get_image_embedding(encoder, image_rgb)
     _log("[segment] Image encoded")
-
+ 
     candidates = _find_opencv_candidates(image_rgb, debug=debug)
     fallback   = False
-
+ 
     if not candidates:
         _log("[segment] No OpenCV candidates — using fallback grid")
         candidates = _fallback_grid_candidates(h, w)
         fallback   = True
-
+ 
     results     = []
     seen_bboxes = []
-
+ 
     for i, bbox in enumerate(candidates):
         if debug:
             _log(f"[segment] Candidate {i}: {bbox}")
-
-        refined_bbox, score = _sam_refine(decoder, embedding, scale, h, w, bbox, debug)
-
+ 
+        refined_bbox, sam_mask, score = _sam_refine(decoder, embedding, scale, h, w, bbox, debug)
+ 
         if refined_bbox is None:
             continue
-
+ 
         rx1,ry1,rx2,ry2 = refined_bbox
-
+ 
         # Deduplication
         dup = False
         for sb in seen_bboxes:
@@ -353,30 +352,34 @@ def get_glass_crops(image_rgb, debug=False):
                     dup=True; break
         if dup:
             continue
-
+ 
         if (ry2-ry1)/max(rx2-rx1,1) < MIN_ASPECT:
             continue
-
+ 
         px1=max(0,rx1-PADDING); py1=max(0,ry1-PADDING)
         px2=min(w,rx2+PADDING); py2=min(h,ry2+PADDING)
         crop = image_rgb[py1:py2, px1:px2]
-
-        if not _is_likely_guinness(crop, debug):
+ 
+        # Crop mask to same padded region for colour check
+        mask_crop = sam_mask[py1:py2, px1:px2] if sam_mask is not None else None
+ 
+        if not _is_likely_guinness(crop, mask=mask_crop, debug=debug):
             _log(f"[segment] Candidate {i} rejected — failed Guinness colour check")
             continue
-
+ 
         seen_bboxes.append(refined_bbox)
         results.append({"crop":crop,"bbox":(px1,py1,px2,py2),"score":score,"index":len(results)})
-
+ 
         if len(results) >= MAX_GLASSES:
             break
-
+ 
     results.sort(key=lambda r: r["bbox"][0])
     for i,r in enumerate(results):
         r["index"] = i
-
+ 
     _log(f"[segment] {len(results)} glass(es) detected ({'fallback-grid' if fallback else 'opencv+sam'})")
     return results
+
 
 
 # ── Visualisation ─────────────────────────────────────────────

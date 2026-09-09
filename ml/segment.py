@@ -1,12 +1,12 @@
 """
 segment.py
 
-Two-stage glass detection pipeline using ONNX Runtime GPU for MobileSAM.
+Two-stage glass detection:
+  Stage 1 — OpenCV candidate finder (~50ms)
+  Stage 2 — MobileSAM SamPredictor with PyTorch (~2-4s per glass)
 
-Stage 1 — OpenCV candidate finder (~50ms)
-Stage 2 — MobileSAM ONNX Runtime GPU refinement (~1-2s per glass)
-
-No PyTorch dependency at inference time.
+Image is resized to 768x1024 before SAM to fit within Nano GPU memory.
+Crops are returned in original image coordinates.
 """
 
 import cv2
@@ -14,102 +14,45 @@ import numpy as np
 import sys
 from pathlib import Path
 
-# ── Constants ─────────────────────────────────────────────────
-
 MIN_ASPECT     = 1.5
 MIN_AREA_FRAC  = 0.03
-MAX_AREA_FRAC  = 0.75
+MAX_AREA_FRAC  = 0.80
 MAX_GLASSES    = 4
 PADDING        = 16
 SAM_IOU_THRESH = 0.75
-ENCODER_PATH   = Path(__file__).parent / "models" / "mobile_sam_encoder.quant.onnx"
-DECODER_PATH   = Path(__file__).parent / "models" / "mobile_sam_decoder.quant.onnx"
-IMAGE_SIZE     = 1024
+SAM_W, SAM_H   = 768, 1024   # resize target for GPU memory
 
 
 def _log(*args):
     print(*args, file=sys.stderr, flush=True)
 
 
-# ── ONNX Runtime sessions ─────────────────────────────────────
+# ── MobileSAM lazy load ───────────────────────────────────────
 
-_encoder_session = None
-_decoder_session = None
+_predictor = None
 
+def _get_predictor():
+    global _predictor
+    if _predictor is not None:
+        return _predictor
 
-def _get_sessions():
-    global _encoder_session, _decoder_session
-    if _encoder_session is not None:
-        return _encoder_session, _decoder_session
+    import torch
+    from mobile_sam import sam_model_registry, SamPredictor
 
-    import onnxruntime as ort
+    weights = Path(__file__).parent / "models" / "mobile_sam.pt"
+    if not weights.exists():
+        raise FileNotFoundError(f"MobileSAM weights not found: {weights}")
 
-    providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']
-    _log(f"[segment] Available providers: {ort.get_available_providers()}")
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
 
-    if not ENCODER_PATH.exists():
-        raise FileNotFoundError(f"Encoder not found: {ENCODER_PATH}")
-    if not DECODER_PATH.exists():
-        raise FileNotFoundError(f"Decoder not found: {DECODER_PATH}")
+    model = sam_model_registry["vit_t"](checkpoint=str(weights))
+    model.to(device).eval().float()
 
-    opts = ort.SessionOptions()
-    opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-
-    _encoder_session = ort.InferenceSession(str(ENCODER_PATH), sess_options=opts, providers=providers)
-    _decoder_session = ort.InferenceSession(str(DECODER_PATH), sess_options=opts, providers=providers)
-
-    _log(f"[segment] Encoder on: {_encoder_session.get_providers()[0]}")
-    _log(f"[segment] Decoder on: {_decoder_session.get_providers()[0]}")
-
-    return _encoder_session, _decoder_session
-
-
-# ── Preprocessing ─────────────────────────────────────────────
-
-def _preprocess(image_rgb):
-    """
-    Resize image for SAM encoder.
-    samexporter --use-preprocess encoder expects HWC float32, no batch dim.
-    Preprocessing (normalisation, padding) is done inside the ONNX graph.
-    """
-    h, w  = image_rgb.shape[:2]
-    scale = IMAGE_SIZE / max(h, w)
-    new_h = int(h * scale)
-    new_w = int(w * scale)
-
-    resized = cv2.resize(image_rgb, (new_w, new_h))
-
-    # Pad to IMAGE_SIZE x IMAGE_SIZE
-    padded = np.zeros((IMAGE_SIZE, IMAGE_SIZE, 3), dtype=np.float32)
-    padded[:new_h, :new_w] = resized.astype(np.float32)
-
-    return padded, scale, new_h, new_w
-
-
-def _get_image_embedding(encoder, image_rgb):
-    tensor, scale, new_h, new_w = _preprocess(image_rgb)
-    # Input: HWC float32, no batch dimension
-    embedding = encoder.run(None, {"input_image": tensor})[0]
-    return embedding, scale, new_h, new_w
-
-
-def _decode_mask(decoder, embedding, points, labels, orig_h, orig_w):
-    inputs = {
-        "image_embeddings": embedding,
-        "point_coords":     points[np.newaxis].astype(np.float32),
-        "point_labels":     labels[np.newaxis].astype(np.float32),
-        "mask_input":       np.zeros((1, 1, 256, 256), dtype=np.float32),
-        "has_mask_input":   np.array([0], dtype=np.float32),
-        "orig_im_size":     np.array([orig_h, orig_w], dtype=np.float32),
-    }
-
-    masks, iou_scores, _ = decoder.run(None, inputs)
-
-    best_idx   = int(np.argmax(iou_scores[0]))
-    best_score = float(iou_scores[0][best_idx])
-    best_mask  = masks[0][best_idx] > 0.0
-
-    return best_mask, best_score
+    _predictor = SamPredictor(model)
+    _log(f"[segment] MobileSAM loaded on {device}")
+    return _predictor
 
 
 # ── OpenCV candidate finder ───────────────────────────────────
@@ -123,9 +66,9 @@ def _candidates_from_colour(image_rgb, h, w):
     step, win_w = w // 8, w // 5
 
     for cx in range(win_w//2, w-win_w//2, step):
-        x1, x2       = max(0,cx-win_w//2), min(w,cx+win_w//2)
-        bright_rows  = np.where(bright_mask[:,x1:x2].any(axis=1))[0]
-        dark_rows    = np.where(dark_mask[:,x1:x2].any(axis=1))[0]
+        x1, x2      = max(0,cx-win_w//2), min(w,cx+win_w//2)
+        bright_rows = np.where(bright_mask[:,x1:x2].any(axis=1))[0]
+        dark_rows   = np.where(dark_mask[:,x1:x2].any(axis=1))[0]
 
         if len(bright_rows) < 5 or len(dark_rows) < 10: continue
         head_top = int(bright_rows.min())
@@ -154,7 +97,8 @@ def _candidates_from_edges(image_rgb, h, w):
 
 def _candidates_from_contours(image_rgb, h, w):
     gray   = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2GRAY)
-    thresh = cv2.adaptiveThreshold(gray,255,cv2.ADAPTIVE_THRESH_GAUSSIAN_C,cv2.THRESH_BINARY_INV,21,4)
+    thresh = cv2.adaptiveThreshold(gray,255,cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                   cv2.THRESH_BINARY_INV,21,4)
     closed = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, np.ones((5,5),np.uint8))
     contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
@@ -205,8 +149,8 @@ def _find_opencv_candidates(image_rgb, debug=False):
                 and MIN_AREA_FRAC <= ((x2-x1)*(y2-y1))/(h*w) <= MAX_AREA_FRAC]
 
     # Always include centre-of-frame for close-up shots
-    margin   = min(h,w)//6
-    filtered = _merge_boxes(filtered + [(margin,margin,w-margin,h-margin)])
+    margin   = min(h,w) // 6
+    filtered = _merge_boxes(filtered + [(margin, margin, w-margin, h-margin)])
     filtered.sort(key=lambda b: b[0])
     filtered = filtered[:MAX_GLASSES]
 
@@ -224,32 +168,24 @@ def _fallback_grid_candidates(h, w):
     ]
 
 
+# ── Guinness colour check ─────────────────────────────────────
+
 def _is_likely_guinness(crop_rgb, mask=None, debug=False):
-    """
-    Check crop has bright head over dark body.
-    If a SAM mask is provided, zero out background pixels before checking
-    so surrounding scene doesn't corrupt the brightness calculation.
-    """
     THRESHOLD = 20
-    DARK_MAX  = 130  # relaxed — pub lighting varies
+    DARK_MAX  = 130
 
     gray = cv2.cvtColor(crop_rgb, cv2.COLOR_RGB2GRAY).astype(np.float32)
 
-    if mask is not None:
-        # Crop mask to same region
+    if mask is not None and mask.any():
         mh, mw = mask.shape
         ch, cw = gray.shape
-        # Resize mask to crop dimensions
-        mask_crop = cv2.resize(
-            mask.astype(np.uint8),
-            (cw, mh),
-            interpolation=cv2.INTER_NEAREST
-        )[:ch, :cw]
-        # Replace background with NaN equivalent — use mean of masked region
-        bg_val = float(gray[mask_crop > 0].mean()) if mask_crop.any() else gray.mean()
-        gray_masked = gray.copy()
-        gray_masked[mask_crop == 0] = bg_val
-        gray = gray_masked
+        m = cv2.resize(mask.astype(np.uint8),(cw,mh),
+                       interpolation=cv2.INTER_NEAREST)[:ch,:cw].astype(bool)
+        if m.any():
+            bg = float(gray[m].mean())
+            gray_m = gray.copy()
+            gray_m[~m] = bg
+            gray = gray_m
 
     h      = gray.shape[0]
     top    = float(gray[:h//4].mean())
@@ -258,61 +194,115 @@ def _is_likely_guinness(crop_rgb, mask=None, debug=False):
 
     if debug:
         _log(f"[segment]   Guinness check: top={top:.1f} bot={bottom:.1f} "
-             f"diff={diff:.1f} dark={bottom<DARK_MAX} pass={diff>THRESHOLD and bottom<DARK_MAX}")
+             f"diff={diff:.1f} pass={diff>THRESHOLD and bottom<DARK_MAX}")
 
     return diff > THRESHOLD and bottom < DARK_MAX
 
 
 # ── SAM refinement ────────────────────────────────────────────
 
-def _sam_refine(decoder, embedding, scale, orig_h, orig_w, bbox, debug=False):
-    x1,y1,x2,y2 = bbox
-    cx  = (x1+x2)/2
-    h3  = (y2-y1)/3
+def _sam_refine(predictor, image_small, sx, sy, bbox_orig, scale_x, scale_y, debug=False):
+    """
+    Run SamPredictor on a candidate bbox.
+    bbox_orig is in original image coords.
+    Points are scaled to SAM image (image_small) coords.
+    Returns (mask_orig, score) where mask_orig is in original image coords.
+    """
+    import numpy as np
 
-    # Points in SCALED encoder space (not original image coords)
-    raw_points = np.array([
-        [cx*scale, y1*scale+h3*scale],
-        [cx*scale, ((y1+y2)/2)*scale],
-        [cx*scale, y2*scale-h3*scale],
-        [0, 0],  # background
+    x1,y1,x2,y2 = bbox_orig
+
+    # Scale bbox to SAM image coords
+    sx1 = int(x1 * scale_x); sy1 = int(y1 * scale_y)
+    sx2 = int(x2 * scale_x); sy2 = int(y2 * scale_y)
+    scx = (sx1+sx2)//2
+    sh3 = (sy2-sy1)//4
+
+    # 5 foreground points spanning full glass height + background point
+    point_coords = np.array([
+        [scx, sy1+sh3],          # top quarter
+        [scx, sy1+sh3*2],        # upper middle
+        [scx, sy1+sh3*3],        # lower middle
+        [scx, sy2-sh3],          # bottom quarter
+        [scx, (sy1+sy2)//2],     # centre
+        [0, 0],                  # background
     ], dtype=np.float32)
 
-    labels = np.array([1,1,1,0], dtype=np.float32)
+    point_labels = np.array([1,1,1,1,1,0], dtype=np.int32)
 
-    mask, score = _decode_mask(decoder, embedding, raw_points, labels, orig_h, orig_w)
+    # SAM box prompt in SAM coords
+    box = np.array([sx1, sy1, sx2, sy2], dtype=np.float32)
+
+    masks, scores, _ = predictor.predict(
+        point_coords=point_coords,
+        point_labels=point_labels,
+        box=box,
+        multimask_output=True,
+    )
+
+    best_idx   = int(np.argmax(scores))
+    best_score = float(scores[best_idx])
+    best_mask  = masks[best_idx]  # in SAM image (small) coords
 
     if debug:
-        _log(f"[segment]   SAM score: {score:.3f}  mask coverage: {mask.mean()*100:.1f}%")
+        _log(f"[segment]   SAM scores: {scores}  best={best_score:.3f}  "
+             f"coverage={best_mask.mean()*100:.1f}%")
 
-    if score < SAM_IOU_THRESH:
-        return None, None, score
+    if best_score < SAM_IOU_THRESH:
+        return None, None, best_score
 
-    rows = np.where(mask.any(axis=1))[0]
-    cols = np.where(mask.any(axis=0))[0]
+    # Scale mask back to original image coords
+    orig_h = int(image_small.shape[0] / scale_y)
+    orig_w = int(image_small.shape[1] / scale_x)
+    mask_orig = cv2.resize(
+        best_mask.astype(np.uint8),
+        (orig_w, orig_h),
+        interpolation=cv2.INTER_NEAREST
+    ).astype(bool)
+
+    # Bbox from mask in original coords
+    rows = np.where(mask_orig.any(axis=1))[0]
+    cols = np.where(mask_orig.any(axis=0))[0]
     if len(rows)==0 or len(cols)==0:
-        return None, None, score
+        return None, None, best_score
 
-    return (int(cols.min()),int(rows.min()),int(cols.max()),int(rows.max())), mask, score
+    return (int(cols.min()),int(rows.min()),
+            int(cols.max()),int(rows.max())), mask_orig, best_score
 
 
 # ── Main entry point ──────────────────────────────────────────
 
 def get_glass_crops(image_rgb, debug=False):
-    h, w = image_rgb.shape[:2]
-    encoder, decoder = _get_sessions()
+    """
+    Detect all pint glasses and return cropped regions.
+    """
+    import torch
 
+    orig_h, orig_w = image_rgb.shape[:2]
+
+    # Resize for SAM GPU memory budget
+    image_small = cv2.resize(image_rgb, (SAM_W, SAM_H))
+    scale_x     = SAM_W / orig_w
+    scale_y     = SAM_H / orig_h
+
+    predictor = _get_predictor()
+
+    # Set image once
     _log("[segment] Encoding image...")
-    embedding, scale, new_h, new_w = _get_image_embedding(encoder, image_rgb)
+    predictor.set_image(image_small)
     _log("[segment] Image encoded")
 
+    # Stage 1: OpenCV on original image for accurate candidate coords
     candidates = _find_opencv_candidates(image_rgb, debug=debug)
     fallback   = False
 
     if not candidates:
         _log("[segment] No OpenCV candidates — using fallback grid")
-        candidates = _fallback_grid_candidates(h, w)
+        candidates = _fallback_grid_candidates(orig_h, orig_w)
         fallback   = True
+
+    if debug:
+        _log(f"[segment] {len(candidates)} candidate(s) → SAM refinement")
 
     results     = []
     seen_bboxes = []
@@ -321,9 +311,15 @@ def get_glass_crops(image_rgb, debug=False):
         if debug:
             _log(f"[segment] Candidate {i}: {bbox}")
 
-        refined_bbox, sam_mask, score = _sam_refine(decoder, embedding, scale, h, w, bbox, debug)
+        refined_bbox, mask_orig, score = _sam_refine(
+            predictor, image_small,
+            SAM_W, SAM_H, bbox,
+            scale_x, scale_y, debug
+        )
 
         if refined_bbox is None:
+            if debug:
+                _log(f"[segment] Candidate {i} rejected by SAM")
             continue
 
         rx1,ry1,rx2,ry2 = refined_bbox
@@ -340,33 +336,48 @@ def get_glass_crops(image_rgb, debug=False):
                 if inter/(a1+a2-inter) > 0.4:
                     dup=True; break
         if dup:
+            if debug:
+                _log(f"[segment] Candidate {i} duplicate — skipped")
             continue
 
         if (ry2-ry1)/max(rx2-rx1,1) < MIN_ASPECT:
+            if debug:
+                _log(f"[segment] Candidate {i} aspect ratio too low")
             continue
 
+        # Crop with padding
         px1=max(0,rx1-PADDING); py1=max(0,ry1-PADDING)
-        px2=min(w,rx2+PADDING); py2=min(h,ry2+PADDING)
+        px2=min(orig_w,rx2+PADDING); py2=min(orig_h,ry2+PADDING)
         crop = image_rgb[py1:py2, px1:px2]
 
-        # Crop mask to same padded region for colour check
-        mask_crop = sam_mask[py1:py2, px1:px2] if sam_mask is not None else None
+        # Mask crop for colour check
+        mask_crop = mask_orig[py1:py2, px1:px2] if mask_orig is not None else None
 
         if not _is_likely_guinness(crop, mask=mask_crop, debug=debug):
             _log(f"[segment] Candidate {i} rejected — failed Guinness colour check")
             continue
 
         seen_bboxes.append(refined_bbox)
-        results.append({"crop":crop,"bbox":(px1,py1,px2,py2),"score":score,"index":len(results)})
+        results.append({
+            "crop":  crop,
+            "bbox":  (px1,py1,px2,py2),
+            "score": score,
+            "index": len(results),
+        })
 
         if len(results) >= MAX_GLASSES:
             break
+
+        # Free GPU cache between candidates
+        torch.cuda.empty_cache()
 
     results.sort(key=lambda r: r["bbox"][0])
     for i,r in enumerate(results):
         r["index"] = i
 
-    _log(f"[segment] {len(results)} glass(es) detected ({'fallback-grid' if fallback else 'opencv+sam'})")
+    _log(f"[segment] {len(results)} glass(es) detected "
+         f"({'fallback-grid' if fallback else 'opencv+sam'})")
+
     return results
 
 
@@ -392,7 +403,8 @@ def visualise(image_path, output_path=None, debug=False):
         cv2.rectangle(annotated,(x1,y1),(x2,y2),col,3)
         cv2.putText(annotated,f"Glass {g['index']+1}  {g['score']:.2f}",
                     (x1,max(20,y1-10)),cv2.FONT_HERSHEY_SIMPLEX,0.9,col,2)
-        print(f"  Glass {g['index']+1}: bbox={g['bbox']} score={g['score']:.3f}")
+        print(f"  Glass {g['index']+1}: bbox={g['bbox']} "
+              f"score={g['score']:.3f} crop={g['crop'].shape[:2]}")
 
     if output_path:
         cv2.imwrite(str(output_path), annotated)

@@ -171,8 +171,8 @@ def _fallback_grid_candidates(h, w):
 # ── Guinness colour check ─────────────────────────────────────
 
 def _is_likely_guinness(crop_rgb, mask=None, debug=False):
-    THRESHOLD = 20
-    DARK_MAX  = 130
+    THRESHOLD = 8
+    DARK_MAX  = 110
 
     gray = cv2.cvtColor(crop_rgb, cv2.COLOR_RGB2GRAY).astype(np.float32)
 

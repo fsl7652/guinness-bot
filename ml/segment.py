@@ -270,17 +270,20 @@ def _sam_refine(decoder, embedding, scale, orig_h, orig_w, bbox, debug=False):
     cx  = (x1+x2)/2
     h3  = (y2-y1)/3
 
+    # Points in SCALED encoder space (not original image coords)
     raw_points = np.array([
-        [cx, y1+h3], [cx, (y1+y2)/2], [cx, y2-h3],
+        [cx*scale, y1*scale+h3*scale],
+        [cx*scale, ((y1+y2)/2)*scale],
+        [cx*scale, y2*scale-h3*scale],
         [0, 0],  # background
-    ], dtype=np.float32) * scale
+    ], dtype=np.float32)
 
     labels = np.array([1,1,1,0], dtype=np.float32)
 
     mask, score = _decode_mask(decoder, embedding, raw_points, labels, orig_h, orig_w)
 
     if debug:
-        _log(f"[segment]   SAM score: {score:.3f}")
+        _log(f"[segment]   SAM score: {score:.3f}  mask coverage: {mask.mean()*100:.1f}%")
 
     if score < SAM_IOU_THRESH:
         return None, None, score

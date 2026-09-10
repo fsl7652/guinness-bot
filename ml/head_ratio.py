@@ -39,22 +39,15 @@ def extract_luminance(crop_rgb, kernel_size=21):
     return luminance, smoothed
 
 
-def find_boundary(smoothed, search_top_frac=0.6):
-    """
-    Find the head/body boundary as the sharpest downward gradient
-    in the top portion of the image.
-
-    We only search the top 60% — a head ratio above 0.6 is physically
-    implausible so we avoid false matches from the base of the glass.
-
-    Returns (boundary_y, confidence) where confidence is the gradient
-    magnitude at the boundary (higher = sharper = more confident).
-    """
-    limit     = int(len(smoothed) * search_top_frac)
-    gradient  = np.diff(smoothed[:limit])
-    boundary  = int(np.argmin(gradient))          # sharpest drop
-    confidence = float(-gradient[boundary])       # magnitude of drop
-
+def find_boundary(smoothed, search_top_frac=0.6, search_start_frac=0.05):
+    """Skip the top search_start_frac to avoid rim/background false positives."""
+    start = int(len(smoothed) * search_start_frac)
+    limit = int(len(smoothed) * search_top_frac)
+    
+    gradient  = np.diff(smoothed[start:limit])
+    boundary  = int(np.argmin(gradient)) + start
+    confidence = float(-gradient[boundary - start])
+    
     return boundary, confidence
 
 
